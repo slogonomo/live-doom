@@ -156,4 +156,6 @@ Live Doom is a Linux and Omarchy integration. On a Mac it runs only under Omarch
 
 Live Doom's own code is **0BSD** ([LICENSE](LICENSE)), and its original art is **CC0**. The desktop patch to the AutoDoom/Eternity engine, and any engine built from it, is **GPL-3.0-or-later**; the small audio patch to the bundled SDL2_mixer keeps SDL2_mixer's **zlib** licence. Game data is never included: official games stay © id Software / ZeniMax Media, and the shareware episode and Freedoom keep their own terms. Details and third-party notices are in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 
+Live Doom is a hobby project, provided as-is without warranty (see [LICENSE](LICENSE)). It has been tested on Omarchy with Hyprland 0.56, but use it at your own risk.
+
 Live Doom is an independent fan project. It isn't affiliated with or endorsed by id Software, ZeniMax or Bethesda; "DOOM" is their trademark and is used here only to say which game it plays.
