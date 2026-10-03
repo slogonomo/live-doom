@@ -1,0 +1,32 @@
+{
+  "sources": {
+    "autodoom": {
+      "url": "https://github.com/ioan-chera/AutoDoom.git",
+      "revision": "6a1d1839ee485b753c73e3405834472aca0b4c8f"
+    },
+    "SDL_mixer": {
+      "url": "https://github.com/libsdl-org/SDL_mixer.git",
+      "revision": "8f0c805d54dbd1ff6b4b784d351ca884b8fe5ee9"
+    },
+    "SDL_net": {
+      "url": "https://github.com/libsdl-org/SDL_net.git",
+      "revision": "bec0e57de5f188c97b4762a52b59994ceb931ce1"
+    },
+    "adlmidi": {
+      "url": "https://github.com/Wohlstand/libADLMIDI.git",
+      "revision": "e721728ef11dd97395853514c6ae44b05bd6e71c"
+    }
+  },
+  "freedoom": {
+    "version": "0.13.0",
+    "url": "https://github.com/freedoom/freedoom/releases/download/v0.13.0/freedoom-0.13.0.zip",
+    "sha256": "3f9b264f3e3ce503b4fb7f6bdcb1f419d93c7b546f4df3e874dd878db9688f59",
+    "max_bytes": 33554432,
+    "max_unpacked_bytes": 100663296,
+    "files": {
+      "freedoom1.wad": "7323bcc168c5a45ff10749b339960e98314740a734c30d4b9f3337001f9e703d",
+      "freedoom2.wad": "a8772e088847032510d97ba2312406a6998f21cbab44d4ff10696faa9c0ecd4b",
+      "COPYING.txt": "7c62f2c520769c798774f416637eec4921e5f0aafdac1245ae7c8a8cf65fe102"
+    }
+  }
+}

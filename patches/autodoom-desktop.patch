@@ -1,0 +1,1755 @@
+diff --git a/source/autodoom/b_think.cpp b/source/autodoom/b_think.cpp
+index cfefd51..7d06b28 100644
+--- a/source/autodoom/b_think.cpp
++++ b/source/autodoom/b_think.cpp
+@@ -1867,6 +1867,14 @@ void Bot::doCommand()
+       }
+       return;
+    }
++   if(gamestate == GS_FINALE)
++   {
++      // Text between Doom II maps needs fire/use to advance. Preserve the
++      // normal finale machinery, including its final cast and episode art.
++      if(++m_exitDelay > 5 * 35 && gametic % 35 == 0)
++         pl->cmd.buttons ^= BT_USE;
++      return;
++   }
+    if(gamestate != GS_LEVEL)
+       return;
+ 
+@@ -1919,4 +1927,3 @@ void Bot::InitBots()
+ }
+ 
+ // EOF
+-
+diff --git a/source/d_main.cpp b/source/d_main.cpp
+index 88b20bf..3299053 100644
+--- a/source/d_main.cpp
++++ b/source/d_main.cpp
+@@ -33,6 +33,7 @@
+ #endif
+ 
+ #include "z_zone.h"
++#include "SDL.h"
+ 
+ #include "acs_intr.h"
+ #include "am_map.h"
+@@ -50,6 +51,7 @@
+ #include "d_io.h"
+ #include "d_iwad.h"
+ #include "d_net.h"
++#include "desktop_bridge.h"
+ #include "doomstat.h"
+ #include "dstrings.h"
+ #include "e_edf.h"
+@@ -408,6 +410,8 @@ void D_DoAdvanceDemo()
+ //
+ void D_StartTitle()
+ {
++   // Desktop End Game is a handback, like Quit, rather than an attract loop.
++   if(DD_NativeQuit()) return;
+    gameaction = ga_nothing;
+    demosequence = -1;
+    D_AdvanceDemo();
+@@ -590,7 +594,7 @@ static void D_Display()
+ 
+    // save the current screen if about to wipe
+    // no melting consoles
+-   if(gamestate != wipegamestate &&
++   if(!DD_Active() && gamestate != wipegamestate &&
+       !(wipegamestate == GS_CONSOLE && gamestate != GS_LEVEL))
+       Wipe_StartScreen();
+ 
+@@ -644,7 +648,7 @@ static void D_Display()
+       oldgamestate = wipegamestate = gamestate;
+          
+       // draw pause pic
+-      if(paused && !walkcam_active) // sf: not if walkcam active for
++      if(paused && !DD_Active() && !walkcam_active) // desktop viewer owns pause caption
+       {                             // frads taking screenshots
+          const char *lumpname = GameModeInfo->pausePatch; 
+          
+@@ -1975,6 +1979,7 @@ static void D_DoomInit()
+ void D_DoomMain()
+ {
+    D_DoomInit();
++   DD_Init();
+ 
+    oldgamestate = wipegamestate = gamestate;
+ 
+@@ -1983,8 +1988,70 @@ void D_DoomMain()
+       oldgamestate = GS_NOSTATE;
+ 
+    // killough 12/98: inlined D_DoomLoop
++   uint64_t desktopDeadline = 0;
++   uint64_t desktopRenderDeadline = 0;
++   uint64_t desktopLastFrame = 0;
++   unsigned desktopRenderFPS = 0;
++   bool desktopWasPaused = true;
+    while(1)
+    {
++      if(DD_Active())
++      {
++         I_StartFrame();
++         I_StartTic(); // bridge polls after SDL has cleared unfocused mouse state
++         DD_Poll();
++         D_ProcessEvents();
++         const uint64_t now = SDL_GetPerformanceCounter();
++         const uint64_t frequency = SDL_GetPerformanceFrequency();
++         const uint64_t step = frequency / 35;
++         const bool isPaused = DD_Paused();
++         const unsigned renderFPS = DD_RenderFPS();
++         if(isPaused || desktopWasPaused || now > desktopDeadline + step * 4)
++            desktopDeadline = now;
++         if(isPaused || desktopWasPaused || renderFPS != desktopRenderFPS)
++            desktopRenderDeadline = now;
++         desktopRenderFPS = renderFPS;
++         desktopWasPaused = isPaused;
++         if(!isPaused)
++         {
++            // Simulation remains 35Hz even when native interpolated frames
++            // render more frequently. Bound catch-up and discard suspended
++            // time instead of advancing the world when the wallpaper resumes.
++            for(unsigned count = 0; now >= desktopDeadline && count < 4; ++count)
++            {
++               DD_RunTic();
++               desktopDeadline += step;
++            }
++         }
++         const bool needsFrame = isPaused ?
++            DD_FrameDirty() || now - desktopLastFrame >= frequency :
++            now >= desktopRenderDeadline;
++         if(needsFrame)
++         {
++            if(isPaused && !DD_FrameDirty())
++               DD_Heartbeat();
++            else
++            {
++               const uint64_t elapsed = isPaused ? step : now - (desktopDeadline - step);
++               DD_SetRenderLerp(static_cast<int>(std::min(elapsed, step) * FRACUNIT / step));
++               S_UpdateSounds(players[displayplayer].mo);
++               D_Display();
++               I_UpdateSound();
++               I_SubmitSound();
++               Z_FreeAlloca();
++            }
++            desktopLastFrame = now;
++            if(!isPaused)
++            {
++               const uint64_t frameStep = frequency / renderFPS;
++               if(now > desktopRenderDeadline + frameStep * 2)
++                  desktopRenderDeadline = now;
++               desktopRenderDeadline += frameStep;
++            }
++         }
++         SDL_Delay(isPaused ? 30 : 1);
++         continue;
++      }
+       // frame synchronous IO operations
+       I_StartFrame();
+ 
+diff --git a/source/d_net.cpp b/source/d_net.cpp
+index 48cd43a..34e84eb 100644
+--- a/source/d_net.cpp
++++ b/source/d_net.cpp
+@@ -35,6 +35,7 @@
+ #include "d_gi.h"
+ #include "d_main.h"
+ #include "d_net.h"
++#include "desktop_bridge.h"
+ #include "doomstat.h"
+ #include "e_player.h"
+ #include "e_things.h"
+@@ -285,6 +286,9 @@ int gametime;
+ //
+ void NetUpdate()
+ {
++   // Desktop mode builds one native ticcmd per controlled 35 Hz simulation tick.
++   // The regular wall-clock network accumulator would catch up suspended time.
++   if(DD_Active()) return;
+    int nowtime;
+    int newtics;
+    int realstart;
+diff --git a/source/f_finale.cpp b/source/f_finale.cpp
+index 116bc40..a87c1c9 100644
+--- a/source/f_finale.cpp
++++ b/source/f_finale.cpp
+@@ -34,6 +34,7 @@
+ #include "d_event.h"
+ #include "d_gi.h"
+ #include "d_main.h"
++#include "desktop_bridge.h"
+ #include "doomstat.h"
+ #include "dstrings.h"
+ #include "e_fonts.h"
+@@ -149,6 +150,7 @@ void F_StartFinale(bool secret)
+    finalecount  = 0;
+    
+    F_setupFinale(secret);
++   DD_FinaleBegin();
+ }
+ 
+ //
+@@ -228,6 +230,12 @@ void F_Ticker()
+    
+    // advance animation
+    finalecount++;
++
++   // The bunny scroller reaches its final END6 frame at 1180 + 6 * 5.
++   // Let the native animation finish before starting the desktop bot's hold.
++   const bool desktopEligible = (finalestage == 1 || finalestage == 2) &&
++      (finaletype != FINALE_DOOM_BUNNY || finalecount >= 1180 + 6 * 5);
++   DD_FinaleTic(desktopEligible, finalestage == 2);
+    
+    if(finalestage == 2)
+       F_CastTicker();
+diff --git a/source/g_cmd.cpp b/source/g_cmd.cpp
+index d1a56c4..9cc0daa 100644
+--- a/source/g_cmd.cpp
++++ b/source/g_cmd.cpp
+@@ -38,6 +38,7 @@
+ #include "doomdef.h"
+ #include "doomstat.h"
+ #include "d_event.h"
++#include "desktop_bridge.h"
+ #include "d_main.h"
+ #include "e_player.h" // haleyjd: turbo cmd must alter playerclass info
+ #include "f_wipe.h"
+@@ -99,6 +100,8 @@ CONSOLE_COMMAND(z_dumpcore, cf_hidden)
+ 
+ CONSOLE_COMMAND(starttitle, cf_notnet)
+ {
++   // Stop before demo cleanup; the common title entry is guarded as well.
++   if(DD_NativeQuit()) return;
+    // haleyjd 04/18/03
+    if(demorecording || singledemo)
+       G_CheckDemoStatus();
+@@ -109,6 +112,11 @@ CONSOLE_COMMAND(starttitle, cf_notnet)
+ 
+ CONSOLE_COMMAND(endgame, cf_notnet)
+ {
++   if(DD_Active())
++   {
++      C_RunTextCmd("mn_endgame");
++      return;
++   }
+    C_SetConsole();
+ }
+ 
+@@ -122,6 +130,7 @@ CONSOLE_COMMAND(pause, cf_server)
+ //
+ static void G_QuitDoom()
+ {
++   if(DD_NativeQuit()) return;
+    // haleyjd: re-added code for playing random sound before exit
+    extern int snd_card;
+ 
+diff --git a/source/g_game.cpp b/source/g_game.cpp
+index 320fcbc..92054a1 100644
+--- a/source/g_game.cpp
++++ b/source/g_game.cpp
+@@ -27,6 +27,7 @@
+ //-----------------------------------------------------------------------------
+ 
+ #include "z_zone.h"
++#include "desktop_bridge.h"
+ #include "i_system.h"
+ 
+ // Need gamepad and timer HALs
+@@ -143,6 +144,7 @@ int             totalkills, totalitems, totalsecret;    // for intermission
+ bool            democontinue;
+ bool            demorecording;
+ bool            demoplayback;
++extern bool advancedemo;
+ int             netbot;               // number of single-player helper bots
+ bool            singledemo;           // quit after playing a demo from cmdline
+ bool            precache = true;      // if true, load all graphics at start
+@@ -2071,6 +2073,14 @@ uint64_t G_Signature(const WadDirectory *dir)
+ 
+ static void G_DoSaveGame(void)
+ {
++   // Native demo saves are normally allowed, but cannot replace a desktop
++   // checkpoint with an attract-loop world (including a manual slot 7 save).
++   if(DD_Active() && (gamestate != GS_LEVEL || !usergame || demoplayback || advancedemo))
++   {
++      gameaction = ga_nothing;
++      savedescription[0] = 0;
++      return;
++   }
+    char *name = nullptr;
+    size_t len = M_StringAlloca(&name, 2, 26, basesavegame, savegamename);
+    
+@@ -2082,12 +2092,44 @@ static void G_DoSaveGame(void)
+    savedescription[0] = 0;
+ }
+ 
++// Write a native checkpoint without sending a simulation tic. Rename only a
++// successfully closed file so stopping a paused desktop cannot lose its save.
++bool G_SaveGameImmediate(int slot, const char *description)
++{
++   if(gamestate != GS_LEVEL || !players[consoleplayer].mo ||
++      !usergame || demoplayback || advancedemo || gameaction == ga_playdemo)
++      return false;
++   char name[4096], temporary[4128], text[24] = {};
++   G_SaveGameName(name, sizeof(name), slot);
++   psnprintf(temporary, sizeof(temporary), "%s.tmp", name);
++   psnprintf(text, sizeof(text), "%s", description);
++   const bool previousHubChange = hub_changelevel;
++   hub_changelevel = true; // suppress the periodic checkpoint HUD message
++   const bool written = P_SaveCurrentLevel(temporary, text, true);
++   hub_changelevel = previousHubChange;
++   if(!written) return false;
++   FILE *file = fopen(temporary, "rb");
++   if(!file) return false;
++   fseek(file, 0, SEEK_END);
++   const long size = ftell(file);
++   fclose(file);
++   if(size < 128) return false;
++   return rename(temporary, name) == 0;
++}
++
+ WadDirectory *d_dir;
+ 
+-static void G_DoLoadGame(void)
++static bool G_DoLoadGame(void)
+ {
+    gameaction = ga_nothing;
+-   P_LoadGame(savename);
++   return P_LoadGame(savename);
++}
++
++bool G_ApplyPendingLoadGame()
++{
++   if(gameaction == ga_loadgame)
++      return G_DoLoadGame();
++   return false;
+ }
+ 
+ //
+@@ -2299,7 +2341,7 @@ void G_Ticker()
+             memcpy(cmd, &netcmds[i][buf], sizeof *cmd);
+             
+             // IOANCH: add bot commands if game is running
+-            if(botMap && !demoplayback && !paused)
++            if(!DD_ApplyAgentCommand(i, cmd) && botMap && !demoplayback && !paused)
+             {
+                // if -netbot (0), then move all other players.
+                // if not -netbot (1), then only move console player
+diff --git a/source/g_game.h b/source/g_game.h
+index 6e55a9d..b02d63b 100644
+--- a/source/g_game.h
++++ b/source/g_game.h
+@@ -87,8 +87,10 @@ void G_DeferedInitNewFromDir(skill_t skill, const char *levelname, WadDirectory
+ void G_DeferedPlayDemo(const char *demo);
+ void G_TimeDemo(const char *name, bool showmenu);
+ void G_LoadGame(const char *name, int slot, bool is_command); // killough 5/15/98
++bool G_ApplyPendingLoadGame(); // native load without advancing a simulation tic
+ void G_ForcedLoadGame();                      // killough 5/15/98: forced loadgames
+ void G_SaveGame(int slot, const char *description); // Called by M_Responder.
++bool G_SaveGameImmediate(int slot, const char *description);
+ void G_RecordDemo(const char *name);                // Only called by startup code.
+ void G_RecordDemoContinue(const char *in, const char *name);
+ void G_SetOldDemoOptions();
+diff --git a/source/hu_stuff.cpp b/source/hu_stuff.cpp
+index b9562c1..a317ee4 100644
+--- a/source/hu_stuff.cpp
++++ b/source/hu_stuff.cpp
+@@ -28,6 +28,7 @@
+ //----------------------------------------------------------------------------
+ 
+ #include "z_zone.h"
++#include "desktop_bridge.h"
+ #include "i_system.h"
+ 
+ #include "a_small.h"
+@@ -391,7 +392,9 @@ void HUDMessageWidget::drawer()
+    vtd.fixedColNum = mess_colour;
+    
+    // go down a bit if chat active
+-   vtd.y = chat_active ? hud_font->absh : 0;
++   // Desktop surfaces may cover the monitor area below a thin top bar. Keep
++   // native pickup/chat text below a 3% safe margin without moving the HUD.
++   vtd.y = (chat_active ? hud_font->absh : 0) + (DD_Active() ? 6 : 0);
+    
+    for(int i = 0; i < current_messages; i++)
+    {
+diff --git a/source/m_buffer.cpp b/source/m_buffer.cpp
+index 54530df..46060d9 100644
+--- a/source/m_buffer.cpp
++++ b/source/m_buffer.cpp
+@@ -26,6 +26,11 @@
+ #include "i_system.h"
+ #include "m_buffer.h"
+ #include "m_swap.h"
++#ifdef _WIN32
++#include <io.h>
++#else
++#include <unistd.h>
++#endif
+ 
+ //=============================================================================
+ //
+@@ -230,6 +235,31 @@ void OutBuffer::close()
+    BufferedFileBase::close();
+ }
+ 
++// Check every buffered and OS write before a desktop checkpoint can replace
++// its previous file. The existing void close() intentionally hides errors.
++bool OutBuffer::closeChecked(bool durable)
++{
++   bool success = true;
++   try { if(f) success = flush(); }
++   catch(...) { success = false; }
++   if(f)
++   {
++      if(fflush(f) != 0) success = false;
++      if(durable && success)
++      {
++#ifdef _WIN32
++         if(_commit(_fileno(f)) != 0) success = false;
++#else
++         if(fsync(fileno(f)) != 0) success = false;
++#endif
++      }
++      if(fclose(f) != 0) success = false;
++      f = nullptr;
++   }
++   BufferedFileBase::close();
++   return success;
++}
++
+ //
+ // Buffered writing function.
+ //
+@@ -529,4 +559,3 @@ bool InBuffer::readSint8(int8_t &num)
+ }
+ 
+ // EOF
+-
+diff --git a/source/m_buffer.h b/source/m_buffer.h
+index c1f71f0..4bf3997 100644
+--- a/source/m_buffer.h
++++ b/source/m_buffer.h
+@@ -117,6 +117,7 @@ public:
+    virtual bool createFile(const char *filename, size_t pLen, int pEndian);
+    virtual bool flush();
+    virtual void close();
++   bool closeChecked(bool durable = false);
+ 
+    bool write(const void *data, size_t size);
+    bool writeSint64(int64_t  num);
+@@ -183,5 +184,3 @@ public:
+ #endif
+ 
+ // EOF
+-
+-
+diff --git a/source/p_saveg.cpp b/source/p_saveg.cpp
+index 4fd29af..1103c8b 100644
+--- a/source/p_saveg.cpp
++++ b/source/p_saveg.cpp
+@@ -1310,7 +1310,7 @@ static void P_ArchiveACS(SaveArchive &arc)
+ 
+ #define SAVESTRINGSIZE 24
+ 
+-void P_SaveCurrentLevel(char *filename, char *description)
++bool P_SaveCurrentLevel(char *filename, char *description, bool durable)
+ {
+    int i;
+    char name2[VERSIONSIZE];
+@@ -1323,7 +1323,7 @@ void P_SaveCurrentLevel(char *filename, char *description)
+       const char *str =
+          errno ? strerror(errno) : FC_ERROR "Could not save game: Error unknown";
+       doom_printf("%s", str);
+-      return;
++      return false;
+    }
+ 
+    // Enable buffered IO exceptions
+@@ -1445,17 +1445,23 @@ void P_SaveCurrentLevel(char *filename, char *description)
+       savefile.setThrowing(false);
+       savefile.close();
+       remove(filename);
+-      return;
++      return false;
+    }
+ 
+    // Close the save file
+-   savefile.close();
++   if(!savefile.closeChecked(durable))
++   {
++      doom_printf("Could not save game: final write failed");
++      remove(filename);
++      return false;
++   }
+ 
+    // Check the heap.
+    Z_CheckHeap();
+ 
+    if(!hub_changelevel) // sf: no 'game saved' message for hubs
+       doom_printf("%s", DEH_String("GGSAVED"));  // Ty 03/27/98 - externalized
++   return true;
+ }
+ 
+ //============================================================================
+@@ -1463,7 +1469,7 @@ void P_SaveCurrentLevel(char *filename, char *description)
+ // Loading -- Main Routine
+ //
+ 
+-void P_LoadGame(const char *filename)
++bool P_LoadGame(const char *filename)
+ {
+    int i;
+    //uint64_t checksum, rchecksum;
+@@ -1474,7 +1480,7 @@ void P_LoadGame(const char *filename)
+    {
+       C_Printf(FC_ERROR "Failed to load savegame %s\n", filename);
+       C_SetConsole();
+-      return;
++      return false;
+    }
+ 
+    // Enable buffered IO exceptions
+@@ -1488,7 +1494,7 @@ void P_LoadGame(const char *filename)
+       arc.archiveCString(throwaway, SAVESTRINGSIZE);
+ 
+       if(!arc.readSaveVersion())
+-         return;
++         return false;
+ 
+       // killough 2/14/98: load compatibility mode
+       // haleyjd 06/16/10: reload "inmasterlevels" state
+@@ -1689,6 +1695,7 @@ void P_LoadGame(const char *filename)
+    //  for 'seamless' travel between levels
+    if(hub_changelevel) 
+       P_RestorePlayerPosition();
++   return true;
+ }
+ 
+ //----------------------------------------------------------------------------
+@@ -1742,4 +1749,3 @@ void P_LoadGame(const char *filename)
+ // Lee's Jan 19 sources
+ //
+ //----------------------------------------------------------------------------
+-
+diff --git a/source/p_saveg.h b/source/p_saveg.h
+index ba87e62..c06f50c 100644
+--- a/source/p_saveg.h
++++ b/source/p_saveg.h
+@@ -132,8 +132,8 @@ unsigned int P_NumForThinker(Thinker *th);
+ Thinker *P_ThinkerForNum(unsigned int n);
+ void P_SetNewTarget(Mobj **mop, Mobj *targ);
+ 
+-void P_SaveCurrentLevel(char *filename, char *description);
+-void P_LoadGame(const char *filename);
++bool P_SaveCurrentLevel(char *filename, char *description, bool durable = false);
++bool P_LoadGame(const char *filename);
+ 
+ #endif
+ 
+diff --git a/source/r_main.cpp b/source/r_main.cpp
+index 2ec797b..303789c 100644
+--- a/source/r_main.cpp
++++ b/source/r_main.cpp
+@@ -33,6 +33,7 @@
+ #include "d_dehtbl.h"
+ #include "d_gi.h"
+ #include "d_net.h"
++#include "desktop_bridge.h"
+ #include "doomstat.h"
+ #include "e_things.h"
+ #include "g_game.h"
+@@ -989,7 +990,7 @@ fixed_t R_GetLerp(bool ignorepause)
+    // Interpolation must be disabled during pauses to avoid shaking, unless arg is set
+    if(d_fastrefresh && d_interpolate &&
+       (ignorepause || (!paused && ((!menuactive && !consoleactive) || demoplayback || netgame))))
+-      return i_haltimer.GetFrac();
++      return DD_Active() ? DD_RenderLerp() : i_haltimer.GetFrac();
+    else
+       return FRACUNIT;
+ }
+diff --git a/source/sdl/i_input.cpp b/source/sdl/i_input.cpp
+index 1fc432d..0296511 100644
+--- a/source/sdl/i_input.cpp
++++ b/source/sdl/i_input.cpp
+@@ -33,6 +33,7 @@
+ #include "../c_runcmd.h"
+ #include "../d_event.h"
+ #include "../d_main.h"
++#include "../desktop_bridge.h"
+ #include "../doomdef.h"
+ #include "../doomstat.h"
+ #include "../g_bind.h"
+@@ -803,7 +804,7 @@ void I_StartTicInWindow(SDL_Window *window)
+    if(usemouse && ((mouseAccel_type == ACCELTYPE_CHOCO) ||
+                    (mouseAccel_type == ACCELTYPE_CUSTOM)))
+       I_ReadMouse(window);
++   DD_Poll();
+ }
+ 
+ // EOF
+-
+diff --git a/source/sdl/i_sdlsound.cpp b/source/sdl/i_sdlsound.cpp
+index 1b10a69..e60e892 100644
+--- a/source/sdl/i_sdlsound.cpp
++++ b/source/sdl/i_sdlsound.cpp
+@@ -32,6 +32,7 @@
+ #include "../c_io.h"
+ #include "../c_runcmd.h"
+ #include "../d_main.h"
++#include "../desktop_bridge.h"
+ #include "../d_gi.h"
+ #include "../d_io.h"
+ #include "../doomstat.h"
+@@ -127,7 +128,7 @@ static bool addsfx(sfxinfo_t *sfx, int channel, int loop, unsigned int id, bool
+ #endif
+ 
+    // haleyjd 02/18/05: null ptr check
+-   if(!snd_init || !sfx)
++   if(!snd_init || !sfx || (DD_Active() && Mix_LiveDoomDeviceSuspended()))
+       return false;
+ 
+    // haleyjd 12/23/13: invoke high-level PCM loader
+@@ -548,6 +549,7 @@ static void I_SDLUpdateSoundCB(void *userdata, Uint8 *stream, int len)
+ 
+    // haleyjd 04/21/10: equalization output pass
+    do_3band(mixbuffer[0], leftend0, reinterpret_cast<T *>(stream));
++   DD_PostMix(stream, len, audio_spec.format);
+ }
+ 
+ //
+@@ -864,4 +866,3 @@ i_sounddriver_t i_sdlsound_driver =
+ };
+ 
+ // EOF
+-
+diff --git a/source/sdl/i_sdlvideo.cpp b/source/sdl/i_sdlvideo.cpp
+index 351f15f..218fb1a 100644
+--- a/source/sdl/i_sdlvideo.cpp
++++ b/source/sdl/i_sdlvideo.cpp
+@@ -34,6 +34,7 @@
+ #include "../c_io.h"
+ #include "../c_runcmd.h"
+ #include "../d_main.h"
++#include "../desktop_bridge.h"
+ #include "../i_system.h"
+ #include "../m_argv.h"
+ #include "../m_misc.h"
+@@ -95,7 +96,7 @@ void SDLVideoDriver::FinishUpdate()
+    // Don't update the screen if the window isn't visible.
+    // Not doing this breaks under Windows when we alt-tab away 
+    // while fullscreen.   
+-   if(!(SDL_GetWindowFlags(window) & SDL_WINDOW_SHOWN))
++   if(!DD_Active() && !(SDL_GetWindowFlags(window) & SDL_WINDOW_SHOWN))
+       return;
+ 
+    if(setpalette)
+@@ -111,6 +112,8 @@ void SDLVideoDriver::FinishUpdate()
+    {
+       // Don't bother checking for errors. It should just cancel itself in that case.
+       SDL_BlitSurface(primary_surface, nullptr, rgba_surface, nullptr);
++      DD_Export(rgba_surface);
++      if(DD_Requested()) return; // the Wayland viewer presents the shared pixels
+       SDL_UpdateTexture(sdltexture, nullptr, rgba_surface->pixels, rgba_surface->pitch);
+       SDL_RenderCopy(renderer, sdltexture, nullptr, destrect);
+    }
+@@ -227,7 +230,7 @@ void SDLVideoDriver::SetPrimaryBuffer()
+       if(!primary_surface)
+          I_Error("SDLVideoDriver::SetPrimaryBuffer: failed to create screen temp buffer\n");
+ 
+-      Uint32 pixelformat = SDL_GetWindowPixelFormat(window);
++      Uint32 pixelformat = DD_Requested() ? SDL_PIXELFORMAT_ARGB8888 : SDL_GetWindowPixelFormat(window);
+       if(pixelformat == SDL_PIXELFORMAT_UNKNOWN)
+          pixelformat = SDL_PIXELFORMAT_RGBA32;
+ 
+@@ -238,10 +241,10 @@ void SDLVideoDriver::SetPrimaryBuffer()
+          I_Error("SDLVideoDriver::SetPrimaryBuffer: failed to create true-colour buffer: %s\n",
+                  SDL_GetError());
+       }
+-      sdltexture = SDL_CreateTexture(renderer, pixelformat,
++      sdltexture = DD_Requested() ? nullptr : SDL_CreateTexture(renderer, pixelformat,
+                                      SDL_TEXTUREACCESS_STREAMING,
+                                      video.width + bump, video.height);
+-      if(!sdltexture)
++      if(!DD_Requested() && !sdltexture)
+       {
+          I_Error("SDLVideoDriver::SetPrimaryBuffer: failed to create rendering texture: %s\n",
+                  SDL_GetError());
+@@ -386,7 +389,7 @@ bool SDLVideoDriver::InitGraphicsMode()
+       SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN);
+ #endif
+ 
+-   if(!(renderer = SDL_CreateRenderer(window, -1, renderer_flags)))
++   if(!DD_Requested() && !(renderer = SDL_CreateRenderer(window, -1, renderer_flags)))
+    {
+       if(!(renderer = SDL_CreateRenderer(window, -1, fallback_r_flags)))
+       {
+@@ -479,4 +482,3 @@ CONSOLE_VARIABLE(displaynum, displaynum, 0)
+ 
+ 
+ // EOF
+-
+diff --git a/source/desktop_bridge.cpp b/source/desktop_bridge.cpp
+new file mode 100644
+index 0000000..593b386
+--- /dev/null
++++ b/source/desktop_bridge.cpp
+@@ -0,0 +1,1025 @@
++// Copyright (C) 2026 slogonomo and Live Doom contributors
++// SPDX-License-Identifier: GPL-3.0-or-later
++// One native game is authoritative; desktop and screen saver consume its frames.
++#include "z_zone.h"
++#include "desktop_bridge.h"
++#include "../../../src/bridge.h"
++#include "autodoom/b_botmap.h"
++#include "autodoom/b_think.h"
++#include "d_event.h"
++#include "d_main.h"
++#include "d_net.h"
++#include "doomstat.h"
++#include "d_gi.h"
++#include "d_items.h"
++#include "e_inventory.h"
++#include "e_player.h"
++#include "e_weapons.h"
++#include "g_game.h"
++#include "hal/i_timer.h"
++#include "i_system.h"
++#include "i_video.h"
++#include "in_lude.h"
++#include "hu_over.h"
++#include "mn_engin.h"
++#include "c_io.h"
++#include "c_runcmd.h"
++#include "p_mobj.h"
++#include "p_pspr.h"
++#include "p_setup.h"
++#include "r_draw.h"
++#include "r_main.h"
++#include "r_state.h"
++#include "s_sound.h"
++#include "v_misc.h"
++#include "w_wad.h"
++#include "SDL.h"
++#include "SDL_mixer.h"
++
++#include <cerrno>
++#include <algorithm>
++#include <atomic>
++#include <bitset>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <csignal>
++#include <sstream>
++#include <string>
++#include <vector>
++#include <fcntl.h>
++#include <sys/mman.h>
++#include <sys/socket.h>
++#include <sys/stat.h>
++#include <sys/un.h>
++#include <unistd.h>
++
++extern int maketic;
++extern bool advancedemo;
++extern int fov;
++void D_ProcessEvents();
++void D_DoAdvanceDemo();
++
++namespace {
++bool enabled = false;
++const bool desktopRequested = getenv("DOOM_DESKTOP_FRAME") != nullptr;
++std::atomic<bool> audioGate{false};
++std::atomic<uint32_t> audioPeak{0};
++bool suspended = true;
++bool autoplay = true;
++uint32_t owner = 0, agentGeneration = 0;
++uint32_t deaths = 0, levelsCompleted = 0;
++unsigned agentLifecycleTics = 0;
++int agentLifecycleState = -1;
++struct AgentAction {
++    double move = 0, strafe = 0, turn = 0;
++    int fire = 0, use = 0, run = 0, weapon = 0;
++    unsigned remaining = 0;
++} agentAction;
++struct LifecycleWatch {
++    bool ready = false, alive = false;
++    int state = -1;
++} lifecycle;
++bool audible = false;
++int listener = -1;
++DDHeader *header = nullptr;
++std::string socketPath;
++volatile sig_atomic_t stopping = 0;
++bool checkpointOnStop = true;
++uint64_t lastSave = 0;
++uint64_t frames = 0;
++std::vector<unsigned char> convertedPixels;
++uint64_t revision = 1, publishedRevision = 0;
++uint32_t campaigns = 0;
++std::string campaignStart;
++std::string startupMap;
++skill_t startupSkill = sk_medium;
++uint32_t replans = 0;
++uint32_t stuckEvents = 0;
++int deviceSuspended = -1;
++uint64_t audioMutedSince = 0, audioRetryAt = 0;
++bool audioMutePending = false, audioReopenWarning = false;
++double controlSensitivity = 1.0;
++bool controlMouselook = false;
++unsigned humanRenderFPS = 35;
++int renderLerp = FRACUNIT;
++uint32_t humanQuits = 0;
++bool nativeQuitPending = false;
++unsigned finaleHoldTics = 0, humanFinaleTics = 0;
++bool finaleButtons = false;
++struct Client {
++    int fd;
++    std::string input, output;
++    uint64_t lastActivity;
++    unsigned received = 0, commands = 0;
++    bool eof = false;
++};
++std::vector<Client> clients;
++std::vector<int> heldKeys;
++struct ProgressWatch {
++    bool valid = false;
++    const Mobj *actor = nullptr;
++    std::string map;
++    int time = 0, kills = 0, items = 0, secrets = 0;
++    uint32_t weapons = 0, keys = 0;
++    // Signed 32-bit Q16 coordinates cover exactly 512 cells per axis at
++    // 128 map units per cell. Fixed storage cannot evict a loop into novelty.
++    std::bitset<512 * 512> visited;
++    unsigned tics = 0;
++} progress;
++
++unsigned progressCell(int32_t coordinate)
++{
++    // Bias the signed Q16 range before dividing, including negative positions.
++    return (static_cast<uint32_t>(coordinate) ^ 0x80000000U) >> 23;
++}
++
++void watchBotProgress()
++{
++    const player_t &player = players[consoleplayer];
++    const Mobj *actor = player.mo;
++    if(gamestate != GS_LEVEL || !actor || player.health <= 0 || !botMap) {
++        progress.valid = false;
++        return;
++    }
++    // Only AutoDoom owns this navigation recovery. Human/agent play and pauses
++    // preserve history but neither consume nor reset its running-world deadline.
++    if(owner != 0 || suspended || paused) {
++        // Notice a same-map restart during human/agent play even if its clock
++        // has passed the old value again by the time AutoDoom regains control.
++        if(progress.valid && (progress.actor != actor || progress.map != gamemapname ||
++                              leveltime < progress.time)) progress.valid = false;
++        if(progress.valid) progress.time = leveltime;
++        return;
++    }
++    const bool fresh = !progress.valid || progress.actor != actor || progress.map != gamemapname ||
++                       leveltime < progress.time;
++    if(!fresh && leveltime == progress.time) return;
++    uint32_t weapons = 0, keys = 0;
++    for(unsigned i = 0; i < NUMWEAPONS; ++i) {
++        const auto *weapon = E_WeaponForDEHNum(i);
++        if(weapon && E_PlayerOwnsWeapon(&player, weapon)) weapons |= 1U << i;
++    }
++    static const char *keyNames[] = {ARTI_BLUECARD, ARTI_YELLOWCARD, ARTI_REDCARD,
++                                   ARTI_BLUESKULL, ARTI_YELLOWSKULL, ARTI_REDSKULL};
++    for(unsigned i = 0; i < 6; ++i)
++        if(E_GetItemOwnedAmountName(&player, keyNames[i])) keys |= 1U << i;
++    if(fresh) {
++        progress.visited.reset();
++        progress.weapons = progress.keys = 0;
++    }
++    const unsigned cell = progressCell(actor->y) * 512 + progressCell(actor->x);
++    const bool explored = !progress.visited.test(cell);
++    const bool collected = player.killcount > progress.kills || player.itemcount > progress.items ||
++                           player.secretcount > progress.secrets ||
++                           (weapons & ~progress.weapons) || (keys & ~progress.keys);
++    progress.visited.set(cell);
++    if(fresh || explored || collected) progress.tics = 0;
++    else if(++progress.tics >= 25 * 35) {
++        // Reconsider navigation only. Keep visited history so pacing through
++        // familiar space cannot indefinitely postpone another recovery hint.
++        // mapInit preserves health, inventory, actor and the live map.
++        bots[consoleplayer].mapInit();
++        ++replans;
++        ++stuckEvents;
++        progress.tics = 0;
++    }
++    progress.valid = true;
++    progress.actor = actor;
++    progress.map = gamemapname;
++    progress.time = leveltime;
++    progress.kills = player.killcount;
++    progress.items = player.itemcount;
++    progress.secrets = player.secretcount;
++    progress.weapons |= weapons;
++    progress.keys |= keys;
++}
++
++void stopSignal(int) { stopping = 1; }
++void beginWrite() { __atomic_add_fetch(&header->seq, 1, __ATOMIC_SEQ_CST); }
++void endWrite() { __atomic_add_fetch(&header->seq, 1, __ATOMIC_SEQ_CST); }
++
++void postInput(const event_t &event)
++{
++    // The native ring has only 64 slots and silently wraps on overflow. Drain
++    // after each command, preserving ordering even for a large input batch.
++    D_PostEvent(&event);
++    D_ProcessEvents();
++}
++
++void applyControls()
++{
++    // Native vanilla sensitivity 5 produces a factor of one. Raw sensitivity
++    // 10 is equivalent, with a simple user multiplier and no averaging.
++    mouseSensitivity_horiz = mouseSensitivity_vert = 10.0 * controlSensitivity;
++    mouseSensitivity_vanilla = false;
++    mouseAccel_type = ACCELTYPE_NONE;
++    g_input.smooth_turning = 0;
++    g_input.novert = 1;
++    g_input.automlook = controlMouselook;
++    default_allowmlook = allowmlook = controlMouselook;
++}
++
++bool parseKey(const std::string &line, int &key, int &down, int &character, int &repeat)
++{
++    std::istringstream fields(line);
++    std::string name;
++    character = repeat = 0;
++    if(!(fields >> name >> key >> down) || name != "key") return false;
++    if(!(fields >> std::ws).eof()) {
++        if(!(fields >> character)) return false;
++        if(!(fields >> std::ws).eof() && !(fields >> repeat)) return false;
++    }
++    return (fields >> std::ws).eof() && key > 0 && key < NUMKEYS &&
++           (down == 0 || down == 1) && (character == 0 || (character >= 32 && character <= 126)) &&
++           (repeat == 0 || repeat == 1) && (down || (!character && !repeat));
++}
++
++void releaseInput()
++{
++    for(int key : heldKeys) {
++        event_t event = {ev_keyup, key, 0, 0, false};
++        postInput(event);
++    }
++    heldKeys.clear();
++    G_ClearKeyStates();
++    std::memset(g_input.gameactions, 0, sizeof(g_input.gameactions));
++    std::memset(g_input.mousebuttons, 0, sizeof(g_input.mousebuttons));
++    std::memset(g_input.joyaxes, 0, sizeof(g_input.joyaxes));
++    g_input.mousex = g_input.mousey = 0;
++    g_input.sendpause = false;
++    g_input.dclicks = g_input.dclicks2 = 0;
++    g_input.dclicktime = g_input.dclicktime2 = 0;
++    g_input.dclickstate = g_input.dclickstate2 = false;
++    g_input.turnheld = 0;
++}
++
++void clearAgentAction() { agentAction = AgentAction{}; }
++
++void observeLifecycle()
++{
++    const bool alive = players[consoleplayer].health > 0;
++    if(lifecycle.ready && lifecycle.state == GS_LEVEL) {
++        if(gamestate == GS_LEVEL && lifecycle.alive && !alive) {
++            ++deaths;
++            clearAgentAction();
++        }
++        if(gamestate == GS_INTERMISSION || gamestate == GS_FINALE) {
++            ++levelsCompleted;
++            clearAgentAction();
++        }
++    }
++    lifecycle.ready = true;
++    lifecycle.state = gamestate;
++    lifecycle.alive = alive;
++}
++
++void setOwner(uint32_t next, uint32_t generation)
++{
++    if(owner == next && agentGeneration == generation) return;
++    releaseInput();
++    clearAgentAction();
++    owner = next;
++    agentGeneration = generation;
++    agentLifecycleState = gamestate;
++    agentLifecycleTics = 0;
++    autoplay = owner != 2;
++    if(autoplay) {
++        MN_ClearMenus();
++        Console.current_height = Console.current_target = Console.prev_height = 0;
++        if(owner == 0 && botMap && players[consoleplayer].mo) bots[consoleplayer].mapInit();
++    }
++}
++
++bool parseOwner(const std::string &line, uint32_t &next, uint32_t &generation)
++{
++    std::istringstream fields(line);
++    std::string name;
++    long long parsedOwner, parsedGeneration;
++    if(!(fields >> name >> parsedOwner >> parsedGeneration) || name != "owner" ||
++       !(fields >> std::ws).eof() || parsedOwner < 0 || parsedOwner > 2 ||
++       parsedGeneration < 0 || static_cast<unsigned long long>(parsedGeneration) > UINT32_MAX)
++        return false;
++    next = static_cast<uint32_t>(parsedOwner);
++    generation = static_cast<uint32_t>(parsedGeneration);
++    return true;
++}
++
++bool parseAction(const std::string &line, uint32_t &generation, AgentAction &action)
++{
++    std::istringstream fields(line);
++    std::string name;
++    long long parsedGeneration;
++    int hold = 500;
++    if(!(fields >> name >> parsedGeneration >> action.move >> action.strafe >> action.turn >>
++         action.fire >> action.use >> action.run >> action.weapon) || name != "action") return false;
++    if(!(fields >> std::ws).eof() && !(fields >> hold)) return false;
++    if(!(fields >> std::ws).eof() || parsedGeneration < 0 ||
++       static_cast<unsigned long long>(parsedGeneration) > UINT32_MAX ||
++       !std::isfinite(action.move) || !std::isfinite(action.strafe) || !std::isfinite(action.turn) ||
++       std::abs(action.move) > 1 || std::abs(action.strafe) > 1 || std::abs(action.turn) > 45 ||
++       (action.fire != 0 && action.fire != 1) || (action.use != 0 && action.use != 1) ||
++       (action.run != 0 && action.run != 1) || action.weapon < 0 || action.weapon > 9 ||
++       hold < 1 || hold > 1000) return false;
++    generation = static_cast<uint32_t>(parsedGeneration);
++    action.remaining = (hold * 35 + 999) / 1000;
++    return true;
++}
++
++std::string savePath()
++{
++    char path[4096];
++    G_SaveGameName(path, sizeof(path), 7);
++    return path;
++}
++
++bool liveCheckpointWorld()
++{
++    return gamestate == GS_LEVEL && players[consoleplayer].mo &&
++           usergame && !demoplayback && !advancedemo && gameaction != ga_playdemo;
++}
++
++bool save()
++{
++    if(!liveCheckpointWorld()) return false;
++    // The native serializer works while simulation is suspended. Write a
++    // sibling file and rename it so an interrupted checkpoint keeps the old one.
++    return G_SaveGameImmediate(7, "Ambient Doom");
++}
++
++// A demo is a level-shaped replay: GS_LEVEL alone does not mean playable.
++// Recover on the main thread, including while paused, before any save attempt.
++void recoverAmbientWorld()
++{
++    if(!enabled || (!demoplayback && !advancedemo &&
++       gamestate != GS_DEMOSCREEN && gamestate != GS_CONSOLE)) return;
++    // Respect a genuine new game or load chosen by the human on this event.
++    // These native actions will establish a real world on the next game tic.
++    if(gameaction == ga_newgame || gameaction == ga_loadgame || gameaction == ga_loadlevel) return;
++    releaseInput();
++    clearAgentAction();
++    MN_ClearMenus();
++    Console.current_height = Console.current_target = Console.prev_height = 0;
++    timingdemo = fastdemo = singletics = false;
++    singledemo = false;
++    if(demoplayback && !demorecording) G_CheckDemoStatus();
++    advancedemo = false;
++    G_ReloadDefaults();
++    bool restored = false;
++    const auto path = savePath();
++    if(access(path.c_str(), R_OK) == 0) {
++        G_LoadGame(path.c_str(), 7, false);
++        restored = G_ApplyPendingLoadGame() && liveCheckpointWorld();
++    }
++    if(!restored) {
++        // Names were taken from the initial real world or validated campaign
++        // command, never from the demo which may have replaced gamemapname.
++        const auto &map = campaignStart.empty() ? startupMap : campaignStart;
++        G_DeferedInitNew(startupSkill, map.c_str());
++        G_DoNewGame();
++    }
++    fprintf(stderr, "Live Doom recovered %s after demo/title\n", restored ? "checkpoint" : "campaign start");
++    applyControls();
++    lifecycle.ready = false;
++    progress.valid = false;
++    agentLifecycleState = gamestate;
++    agentLifecycleTics = 0;
++    if(botMap && players[consoleplayer].mo) bots[consoleplayer].mapInit();
++    ++revision;
++}
++
++void cleanup()
++{
++    for(auto &client : clients) close(client.fd);
++    clients.clear();
++    if(listener >= 0) close(listener);
++    listener = -1;
++    if(!socketPath.empty()) unlink(socketPath.c_str());
++    if(header) {
++        beginWrite();
++        header->pid = 0;
++        endWrite();
++        munmap(header, DD_FILE_SIZE);
++        header = nullptr;
++    }
++}
++
++// Retain mixer/decoder state, but release the physical stream while quiet.
++// Main-thread only: never close/reopen from the postmix callback.
++void serviceAudioDevice(uint64_t now)
++{
++    const bool wanted = audible && !suspended;
++    if(!Mix_QuerySpec(nullptr, nullptr, nullptr)) {
++        audioGate.store(false, std::memory_order_release);
++        audioPeak.store(0, std::memory_order_relaxed);
++        return;
++    }
++    bool detached = Mix_LiveDoomDeviceSuspended() != 0;
++    if(!wanted) {
++        if(!audioMutePending) {
++            audioMutePending = true;
++            audioMutedSince = now;
++        }
++        if(!detached && now - audioMutedSince >= 1500) {
++            audioGate.store(false, std::memory_order_release);
++            S_StopSounds(true);
++            if(Mix_LiveDoomSuspendDevice(1) == 0) {
++                detached = true;
++                deviceSuspended = -1;
++                fprintf(stderr, "Live Doom audio device released while inaudible\n");
++            }
++        }
++    } else {
++        audioMutePending = false;
++        if(detached && now >= audioRetryAt) {
++            // Open paused: discard transient sounds before a callback can
++            // resume, then reapply the actual game suspension below.
++            Mix_PauseAudio(1);
++            S_StopSounds(true);
++            if(Mix_LiveDoomSuspendDevice(0) == 0) {
++                detached = false;
++                deviceSuspended = -1;
++                audioRetryAt = 0;
++                audioReopenWarning = false;
++                fprintf(stderr, "Live Doom audio device resumed\n");
++            } else {
++                audioRetryAt = now + 2000;
++                if(!audioReopenWarning) {
++                    fprintf(stderr, "Live Doom audio device unavailable; retrying: %s\n", SDL_GetError());
++                    audioReopenWarning = true;
++                }
++            }
++        }
++    }
++    audioGate.store(wanted && !detached, std::memory_order_release);
++    if(!wanted || detached) audioPeak.store(0, std::memory_order_relaxed);
++    const int pauseDevice = suspended || detached;
++    if(deviceSuspended != pauseDevice) {
++        Mix_PauseAudio(pauseDevice);
++        deviceSuspended = pauseDevice;
++    }
++}
++
++void applyMode()
++{
++    paused = suspended ? 2 : 0;
++    bots[consoleplayer].active = owner == 0;
++    // Native volume sliders remain authoritative. The final gate silences
++    // the short quiet grace; long silence freezes music without restarting it.
++    serviceAudioDevice(SDL_GetTicks64());
++}
++
++const char *command(const std::string &line)
++{
++    int value, key, character, repeat, width, height;
++    double dx, dy, sensitivity;
++    char tail;
++    uint32_t nextOwner, generation;
++    AgentAction nextAction;
++    if(line.compare(0, 9, "campaign ") == 0) {
++        const std::string label = line.substr(9);
++        if(label == "none") campaignStart.clear();
++        else {
++            const bool episode = label.size() == 4 && label[0] == 'E' &&
++                label[1] >= '1' && label[1] <= '9' && label[2] == 'M' &&
++                label[3] >= '1' && label[3] <= '9';
++            const bool numbered = label.size() == 5 && label.compare(0, 3, "MAP") == 0 &&
++                label[3] >= '0' && label[3] <= '9' && label[4] >= '0' && label[4] <= '9';
++            if(!episode && !numbered) return "ERR invalid campaign start\n";
++            const int lump = wGlobalDir.checkNumForName(label.c_str());
++            if(lump < 0 || P_CheckLevel(&wGlobalDir, lump) == LEVEL_FORMAT_INVALID)
++                return "ERR campaign start map missing\n";
++            campaignStart = label;
++        }
++        return "OK\n";
++    } else if(sscanf(line.c_str(), "pause %d %c", &value, &tail) == 1 && (value == 0 || value == 1)) {
++        suspended = value;
++        if(suspended) {
++            releaseInput();
++            clearAgentAction();
++        }
++    } else if(parseOwner(line, nextOwner, generation)) {
++        setOwner(nextOwner, generation);
++    } else if(parseAction(line, generation, nextAction)) {
++        if(owner != 1) return "ERR agent control inactive\n";
++        if(generation != agentGeneration) return "ERR agent generation mismatch\n";
++        // A lease survives a pause, but no action received during suspension
++        // may become latent movement when the desktop later resumes.
++        if(suspended || nativeQuitPending || gamestate != GS_LEVEL ||
++           !players[consoleplayer].mo || players[consoleplayer].health <= 0)
++            clearAgentAction();
++        else
++            agentAction = nextAction;
++        return "OK\n";
++    } else if(sscanf(line.c_str(), "bot %d %c", &value, &tail) == 1 && (value == 0 || value == 1)) {
++        setOwner(value ? 0 : 2, 0);
++    } else if(sscanf(line.c_str(), "audio %d %c", &value, &tail) == 1 && (value == 0 || value == 1)) {
++        audible = value;
++    } else if(parseKey(line, key, value, character, repeat)) {
++        if(autoplay || suspended || nativeQuitPending) return "ERR human control inactive\n";
++        event_t event = {value ? ev_keydown : ev_keyup, key, 0, 0, !!repeat};
++        postInput(event);
++        if(character) {
++            event_t text = {ev_text, character, 0, 0, !!repeat};
++            postInput(text);
++        }
++        if(value) {
++            if(std::find(heldKeys.begin(), heldKeys.end(), key) == heldKeys.end())
++                heldKeys.push_back(key);
++        } else {
++            heldKeys.erase(std::remove(heldKeys.begin(), heldKeys.end(), key), heldKeys.end());
++        }
++    } else if(sscanf(line.c_str(), "text %d %c", &character, &tail) == 1 &&
++              character >= 32 && character <= 126) {
++        if(autoplay || suspended || nativeQuitPending) return "ERR human control inactive\n";
++        event_t event = {ev_text, character, 0, 0, false};
++        postInput(event);
++    } else if(sscanf(line.c_str(), "mouse %lf %lf %c", &dx, &dy, &tail) == 2 &&
++              std::isfinite(dx) && std::isfinite(dy) && std::abs(dx) <= 16384 && std::abs(dy) <= 16384) {
++        if(autoplay || suspended || nativeQuitPending) return "ERR human control inactive\n";
++        event_t event = {ev_mouse, 0, dx, -dy, false};
++        postInput(event);
++    } else if(sscanf(line.c_str(), "controls %lf %d %c", &sensitivity, &value, &tail) == 2 &&
++              std::isfinite(sensitivity) && sensitivity >= 0.1 && sensitivity <= 4.0 &&
++              (value == 0 || value == 1)) {
++        controlSensitivity = sensitivity;
++        controlMouselook = value;
++        applyControls();
++    } else if(sscanf(line.c_str(), "render %d %c", &value, &tail) == 1 && value >= 35 && value <= 120) {
++        humanRenderFPS = value;
++    } else if(line == "release") {
++        releaseInput();
++        clearAgentAction();
++    } else if(line == "save") {
++        if(!liveCheckpointWorld())
++            return "ERR no live level to save\n";
++        return save() ? "OK\n" : "ERR checkpoint write failed\n";
++    } else if(line == "load") {
++        const auto path = savePath();
++        if(access(path.c_str(), R_OK) != 0) return "ERR checkpoint missing\n";
++        releaseInput();
++        clearAgentAction();
++        G_LoadGame(path.c_str(), 7, true);
++        // Process the native load action without advancing the clock or world.
++        if(!G_ApplyPendingLoadGame() || gamestate != GS_LEVEL || !players[consoleplayer].mo)
++            return "ERR native checkpoint rejected\n";
++        applyControls();
++        // Restoring a checkpoint is not a new death/completion event.
++        lifecycle.ready = false;
++        progress.valid = false;
++        if(botMap && players[consoleplayer].mo) bots[consoleplayer].mapInit();
++    } else if(line == "replan") {
++        if(!autoplay || gamestate != GS_LEVEL || !players[consoleplayer].mo ||
++           players[consoleplayer].health <= 0 || !botMap)
++            return "ERR no live bot navigation\n";
++        bots[consoleplayer].mapInit();
++        progress.tics = 0;
++        ++replans;
++    } else if(sscanf(line.c_str(), "video %d %d %c", &width, &height, &tail) == 2) {
++        if(width < 320 || height < 200 || width > DD_MAX_WIDTH || height > DD_MAX_HEIGHT)
++            return "ERR video dimensions out of range\n";
++        // Native mode reset rebuilds projection, buffers and HUD geometry. It
++        // does not tick, replace the game world or touch the audio device.
++        if(video.width != width || video.height != height) {
++            char mode[48];
++            snprintf(mode, sizeof(mode), "%dx%dw", width, height);
++            efree(i_videomode);
++            i_videomode = estrdup(mode);
++            efree(i_default_videomode);
++            i_default_videomode = estrdup(mode);
++            I_SetMode();
++        }
++    } else if(line == "quit") {
++        stopping = 1;
++    } else if(line == "quit-nosave") {
++        checkpointOnStop = false;
++        stopping = 1;
++    } else return "ERR unknown or malformed command\n";
++    ++revision;
++    applyMode();
++    return "OK\n";
++}
++}
++
++bool DD_Active() { return enabled; }
++bool DD_Requested() { return desktopRequested; }
++bool DD_Paused() { return suspended; }
++bool DD_FrameDirty() { return enabled && revision != publishedRevision; }
++unsigned DD_RenderFPS() { return autoplay ? 35 : humanRenderFPS; }
++int DD_RenderLerp() { return autoplay || suspended ? FRACUNIT : renderLerp; }
++void DD_SetRenderLerp(int fraction) { renderLerp = std::max(0, std::min(fraction, FRACUNIT)); }
++
++bool DD_NativeQuit()
++{
++    if(!enabled) return false;
++    if(!nativeQuitPending) ++humanQuits;
++    nativeQuitPending = true;
++    return true;
++}
++
++static void DD_FinishNativeQuit()
++{
++    if(!nativeQuitPending) return;
++    nativeQuitPending = false;
++    // The native menu's Quit leaves desktop takeover, preserving this world.
++    // Service shutdown uses the bridge quit commands and still exits normally.
++    // Complete outside D_ProcessEvents: posting held-key releases inside a
++    // responder would re-enter its current event before the ring tail advances.
++    releaseInput();
++    MN_ClearMenus();
++    Console.current_height = Console.current_target = Console.prev_height = 0;
++    owner = agentGeneration = 0;
++    autoplay = true;
++    clearAgentAction();
++    audible = false;
++    if(botMap && players[consoleplayer].mo) bots[consoleplayer].mapInit();
++    ++revision;
++    applyMode();
++}
++
++void DD_Init()
++{
++    const char *framePath = getenv("DOOM_DESKTOP_FRAME");
++    const char *socketEnv = getenv("DOOM_DESKTOP_ENGINE_SOCKET");
++    if(!framePath && !socketEnv) return;
++    if(!framePath || !socketEnv || framePath[0] != '/' || socketEnv[0] != '/')
++        I_Error("Desktop bridge requires absolute frame and socket paths\n");
++    socketPath = socketEnv;
++    if(socketPath.size() >= sizeof(sockaddr_un::sun_path))
++        I_Error("Desktop engine socket path is too long\n");
++    int fd = open(framePath, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
++    struct stat info;
++    if(fd < 0 || fstat(fd, &info) != 0 || !S_ISREG(info.st_mode) || info.st_uid != geteuid() ||
++       fchmod(fd, 0600) != 0 || ftruncate(fd, DD_FILE_SIZE) != 0)
++        I_Error("Cannot create desktop framebuffer: %s\n", strerror(errno));
++    header = static_cast<DDHeader *>(mmap(nullptr, DD_FILE_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
++    close(fd);
++    if(header == MAP_FAILED) {
++        header = nullptr;
++        I_Error("Cannot map desktop framebuffer: %s\n", strerror(errno));
++    }
++    // Leave unused capacity sparse at small test resolutions. A fresh frame
++    // overwrites its pixel region before the nonzero frame counter is visible.
++    memset(header, 0, DD_HEADER_SIZE);
++    if(lstat(socketPath.c_str(), &info) == 0) {
++        if(!S_ISSOCK(info.st_mode) || info.st_uid != geteuid())
++            I_Error("Refusing to replace non-owned desktop socket\n");
++        unlink(socketPath.c_str());
++    }
++    listener = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
++    sockaddr_un address = {};
++    address.sun_family = AF_UNIX;
++    strcpy(address.sun_path, socketPath.c_str());
++    if(listener < 0 || bind(listener, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0 ||
++       chmod(socketPath.c_str(), 0600) != 0 || listen(listener, 16) != 0)
++        I_Error("Cannot create desktop command socket: %s\n", strerror(errno));
++    header->magic = DD_MAGIC;
++    header->version = DD_VERSION;
++    header->pid = getpid();
++    enabled = true;
++    startupSkill = gameskill;
++    startupMap = gamestate == GS_LEVEL && usergame && !demoplayback ? gamemapname :
++                 (GameModeInfo->flags & GIF_MAPXY ? "MAP01" : "E1M1");
++    d_fastrefresh = d_interpolate = true;
++    if(video.width > DD_MAX_WIDTH || video.height > DD_MAX_HEIGHT)
++        I_Error("Desktop video mode exceeds %dx%d capacity\n", DD_MAX_WIDTH, DD_MAX_HEIGHT);
++    // Add familiar movement alongside the original arrows and mouse bindings.
++    C_RunTextCmd("bind w forward");
++    C_RunTextCmd("bind s backward");
++    C_RunTextCmd("bind a moveleft");
++    C_RunTextCmd("bind d moveright");
++    C_RunTextCmd("bind e use");
++    applyControls();
++    applyMode();
++    if(gameaction == ga_loadgame) {
++        G_ApplyPendingLoadGame();
++        applyControls();
++        if(botMap && players[consoleplayer].mo) bots[consoleplayer].mapInit();
++        applyMode();
++    }
++    signal(SIGTERM, stopSignal);
++    signal(SIGINT, stopSignal);
++    atexit(cleanup);
++    lastSave = SDL_GetTicks64();
++}
++
++void DD_Poll()
++{
++    if(!enabled) return;
++    // SDL events precede bridge commands, exactly as they did in the outer
++    // loop. Input commands then drain individually so keyups cannot be lost.
++    D_ProcessEvents();
++    const uint64_t now = SDL_GetTicks64();
++    for(int count = 0; count < 32; ++count) {
++        int fd = accept4(listener, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
++        if(fd < 0) break;
++        if(clients.size() >= 64) close(fd);
++        else clients.push_back({fd, {}, {}, now});
++    }
++    for(size_t i = 0; i < clients.size();) {
++        auto &client = clients[i];
++        char chunk[512];
++        bool done = now - client.lastActivity >= 1000;
++        while(!done && !client.eof) {
++            const ssize_t length = recv(client.fd, chunk, sizeof(chunk), 0);
++            if(length > 0) {
++                client.received += length;
++                client.lastActivity = now;
++                if(client.received > 4096) {
++                    client.output += "ERR command batch too large\n";
++                    client.eof = true;
++                    client.input.clear();
++                    break;
++                }
++                client.input.append(chunk, length);
++            } else if(length == 0) {
++                client.eof = true;
++                break;
++            } else if(errno == EINTR) continue;
++            else {
++                if(errno != EAGAIN && errno != EWOULDBLOCK) done = true;
++                break;
++            }
++        }
++        size_t newline;
++        while(!done && (newline = client.input.find('\n')) != std::string::npos) {
++            std::string line = client.input.substr(0, newline);
++            client.input.erase(0, newline + 1);
++            if(!line.empty() && line.back() == '\r') line.pop_back();
++            if(++client.commands > 128) {
++                client.output += "ERR too many commands\n";
++                client.eof = true;
++                client.input.clear();
++                break;
++            }
++            client.output += command(line);
++            if(stopping) {
++                client.eof = true;
++                client.input.clear();
++                break;
++            }
++        }
++        if(client.eof && !client.input.empty()) {
++            client.output += "ERR incomplete command\n";
++            client.input.clear();
++        }
++        if(!done && !client.output.empty()) {
++            const ssize_t length = send(client.fd, client.output.data(), client.output.size(), MSG_NOSIGNAL);
++            if(length > 0) client.output.erase(0, length);
++            else if(length == 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) done = true;
++        }
++        if(client.eof && client.output.empty()) done = true;
++        if(done) {
++            close(client.fd);
++            clients.erase(clients.begin() + i);
++        } else ++i;
++    }
++    DD_FinishNativeQuit();
++    recoverAmbientWorld();
++    applyMode();
++    if(!stopping && now - lastSave >= 30000) {
++        save();
++        lastSave = now;
++    }
++    if(stopping) {
++        if(checkpointOnStop) save();
++        I_QuitFast();
++    }
++}
++
++void DD_RunTic()
++{
++    recoverAmbientWorld();
++    const int previousState = gamestate;
++    observeLifecycle();
++    MN_Ticker();
++    C_Ticker();
++    V_FPSTicker();
++    G_BuildTiccmd(&netcmds[consoleplayer][gametic % BACKUPTICS], players[consoleplayer], g_input, true);
++    if(advancedemo) D_DoAdvanceDemo();
++    i_haltimer.SaveMS();
++    G_Ticker();
++    recoverAmbientWorld();
++    applyMode();
++    if(previousState != gamestate) {
++        agentLifecycleState = gamestate;
++        agentLifecycleTics = 0;
++        clearAgentAction();
++    }
++    observeLifecycle();
++    watchBotProgress();
++    ++gametic;
++    maketic = gametic;
++}
++
++bool DD_ApplyAgentCommand(int index, ticcmd_t *cmd)
++{
++    if(!enabled || owner != 1 || index != consoleplayer || demoplayback) return false;
++    // Preserve consistency while replacing every gameplay/input field. An
++    // expired or absent action is neutral, never a return to AutoDoom walking.
++    const int16_t consistency = cmd->consistency;
++    std::memset(cmd, 0, sizeof(*cmd));
++    cmd->consistency = consistency;
++    if(suspended || paused) return true;
++    if(agentLifecycleState != gamestate) {
++        agentLifecycleState = gamestate;
++        agentLifecycleTics = 0;
++        clearAgentAction();
++    }
++    player_t &player = players[index];
++    if(gamestate != GS_LEVEL) {
++        clearAgentAction();
++        if(gamestate == GS_INTERMISSION && GameModeInfo->interfuncs->TallyDone()) {
++            if(++agentLifecycleTics > 100 && gametic % 2) cmd->buttons = BT_USE;
++        } else if(gamestate == GS_FINALE) {
++            if(++agentLifecycleTics > 5 * 35 && gametic % 35 == 0) cmd->buttons = BT_USE;
++        }
++        return true;
++    }
++    if(player.health <= 0) {
++        clearAgentAction();
++        if(gametic % 128 == 0) cmd->buttons = BT_USE;
++        return true;
++    }
++    if(!agentAction.remaining) return true;
++    const auto action = agentAction;
++    --agentAction.remaining;
++    cmd->forwardmove = static_cast<int8_t>(std::lround(action.move * player.pclass->forwardmove[action.run]));
++    cmd->sidemove = static_cast<int8_t>(std::lround(action.strafe * player.pclass->sidemove[action.run]));
++    cmd->angleturn = static_cast<int16_t>(std::lround(action.turn * 65536.0 / 360.0));
++    cmd->buttons = (action.fire ? BT_ATTACK : 0) | (action.use ? BT_USE : 0);
++    if(action.weapon) {
++        weaponinfo_t *weapon = P_GetPlayerWeapon(&player, action.weapon - 1);
++        if(weapon && E_PlayerOwnsWeapon(&player, weapon)) {
++            if(demo_version >= 401) {
++                const auto *slot = E_FindEntryForWeaponInSlotIndex(&player, weapon, action.weapon - 1);
++                cmd->weaponID = weapon->id + 1;
++                if(slot) cmd->slotIndex = slot->slotindex;
++            } else {
++                cmd->buttons |= BT_CHANGE | (weapon->dehnum << BT_WEAPONSHIFT);
++            }
++        }
++    }
++    return true;
++}
++
++void DD_Export(SDL_Surface *surface)
++{
++    if(!enabled || !surface || surface->w <= 0 || surface->h <= 0 ||
++       surface->w > DD_MAX_WIDTH || surface->h > DD_MAX_HEIGHT) return;
++    observeLifecycle();
++    auto *pixels = reinterpret_cast<unsigned char *>(header) + DD_HEADER_SIZE;
++    const int stride = surface->w * 4;
++    const size_t bytes = static_cast<size_t>(stride) * surface->h;
++    convertedPixels.resize(bytes);
++    if(SDL_ConvertPixels(surface->w, surface->h, surface->format->format,
++                         surface->pixels, surface->pitch, SDL_PIXELFORMAT_ARGB8888,
++                         convertedPixels.data(), stride) != 0) return;
++    // Compare exact exported pixels before opening the seqlock. The private
++    // conversion buffer is bounded by DD_MAX_WIDTH/HEIGHT, reused each frame.
++    // Header telemetry still advances even when a frozen view needs no upload.
++    const bool changed = !frames || header->width != static_cast<unsigned>(surface->w) ||
++                         header->height != static_cast<unsigned>(surface->h) ||
++                         std::memcmp(pixels, convertedPixels.data(), bytes) != 0;
++    beginWrite();
++    if(changed) {
++        std::memcpy(pixels, convertedPixels.data(), bytes);
++        ++frames;
++    }
++    header->width = surface->w;
++    header->height = surface->h;
++    header->stride = stride;
++    header->bot = autoplay;
++    header->paused = suspended;
++    header->audible = audioGate.load(std::memory_order_acquire);
++    header->gamestate = gamestate;
++    header->frame = frames;
++    header->tic = gametic;
++    header->leveltime = leveltime;
++    const player_t &player = players[consoleplayer];
++    header->health = player.health;
++    header->x = player.mo ? player.mo->x : 0;
++    header->y = player.mo ? player.mo->y : 0;
++    header->kills = player.killcount;
++    header->items = player.itemcount;
++    header->secrets = player.secretcount;
++    snprintf(header->map, sizeof(header->map), "%s", gamemapname);
++    header->campaign = campaigns;
++    header->audio_peak = audioPeak.load(std::memory_order_relaxed);
++    header->angle = player.mo ? static_cast<int32_t>(player.mo->angle) : 0;
++    const bool legacyPixels = (surface->w == 320 && surface->h == 200) ||
++                              (surface->w == 640 && surface->h == 400);
++    header->pixel_aspect_num = legacyPixels ? 5 : 1;
++    header->pixel_aspect_den = legacyPixels ? 6 : 1;
++    header->fov = fov;
++    header->view_width = viewwindow.width;
++    header->view_height = viewwindow.height;
++    header->hud_layout = hud_enabled ? hud_overlaylayout : 0;
++    header->bot_replans = replans;
++    header->render_fps = DD_RenderFPS();
++    header->render_lerp = gamestate == GS_LEVEL ? view.lerp : FRACUNIT;
++    header->render_angle = static_cast<int32_t>(viewangle);
++    header->human_quits = humanQuits;
++    header->owner = owner;
++    header->agent_gen = agentGeneration;
++    header->armor = player.armorpoints;
++    static const char *ammoNames[] = {"AmmoClip", "AmmoShell", "AmmoCell", "AmmoMissile"};
++    for(unsigned i = 0; i < 4; ++i) header->ammo[i] = E_GetItemOwnedAmountName(&player, ammoNames[i]);
++    header->ready_weapon = player.readyweapon ? player.readyweapon->dehnum : -1;
++    header->weapons_owned = 0;
++    for(unsigned i = 0; i < NUMWEAPONS; ++i) {
++        const auto *weapon = E_WeaponForDEHNum(i);
++        if(weapon && E_PlayerOwnsWeapon(&player, weapon)) header->weapons_owned |= 1U << i;
++    }
++    header->keys = 0;
++    static const char *keyNames[] = {ARTI_BLUECARD, ARTI_YELLOWCARD, ARTI_REDCARD,
++                                   ARTI_BLUESKULL, ARTI_YELLOWSKULL, ARTI_REDSKULL};
++    for(unsigned i = 0; i < 6; ++i)
++        if(E_GetItemOwnedAmountName(&player, keyNames[i])) header->keys |= 1U << i;
++    header->z = player.mo ? player.mo->z : 0;
++    header->momx = player.mo ? player.mo->momx : 0;
++    header->momy = player.mo ? player.mo->momy : 0;
++    header->damage_count = player.damagecount;
++    header->deaths = deaths;
++    header->levels_completed = levelsCompleted;
++    header->bot_stuck = stuckEvents;
++    publishedRevision = revision;
++    endWrite();
++}
++
++void DD_Heartbeat()
++{
++    if(!enabled || !header || !header->frame) return;
++    // With no game tics or commands, the last native image remains exact. The
++    // paused heartbeat updates status without re-rendering/copying 4K pixels or
++    // making viewers upload an unchanged image again.
++    beginWrite();
++    header->audio_peak = audioPeak.load(std::memory_order_relaxed);
++    endWrite();
++}
++
++void DD_PostMix(unsigned char *samples, int bytes, unsigned short format)
++{
++    if(!desktopRequested || bytes <= 0) return;
++    // This tail hook follows the existing engine mixer, including music,
++    // digital SFX, reverb and equalization. Never replace its postmix callback.
++    // Gating the final samples also prevents an old SFX/reverb tail or startup
++    // music buffer from leaking sound during the first muted desktop frame.
++    if(!audioGate.load(std::memory_order_acquire)) {
++        memset(samples, SDL_AUDIO_ISFLOAT(format) || SDL_AUDIO_ISSIGNED(format) ? 0 : 0x80, bytes);
++        audioPeak.store(0, std::memory_order_relaxed);
++        return;
++    }
++    double peak = 0;
++    if(SDL_AUDIO_ISFLOAT(format) && SDL_AUDIO_BITSIZE(format) == 32) {
++        const float *data = reinterpret_cast<const float *>(samples);
++        for(int i = 0; i < bytes / 4; ++i)
++            peak = std::max(peak, std::abs(static_cast<double>(data[i])) * 32767.0);
++    } else if(SDL_AUDIO_BITSIZE(format) == 16) {
++        const int16_t *data = reinterpret_cast<const int16_t *>(samples);
++        for(int i = 0; i < bytes / 2; ++i)
++            peak = std::max(peak, std::abs(static_cast<double>(data[i])));
++    }
++    audioPeak.store(static_cast<uint32_t>(std::min(peak, 32767.0)), std::memory_order_relaxed);
++}
++
++void DD_FinaleBegin()
++{
++    finaleHoldTics = humanFinaleTics = 0;
++    finaleButtons = false;
++    agentLifecycleTics = 0;
++    agentLifecycleState = GS_FINALE;
++    clearAgentAction();
++}
++
++void DD_FinaleTic(bool eligible, bool cast)
++{
++    // Story text keeps its native read/acceleration timing; the bunny scroller
++    // must reach END6 before eligible is true. Count the same finale under both
++    // owners so handing it back never restarts a hold the human already saw.
++    if(!enabled || suspended) return;
++    if(!autoplay) ++humanFinaleTics;
++    const bool buttons = players[consoleplayer].cmd.buttons & (BT_ATTACK | BT_USE);
++    const bool pressed = buttons && !finaleButtons;
++    finaleButtons = buttons;
++    if(!eligible) return;
++    ++finaleHoldTics;
++    const unsigned hold = (cast ? 12 : 5) * 35;
++    const bool automatic = autoplay && (finaleHoldTics >= hold || humanFinaleTics >= hold);
++    // Static episode art can be dismissed by native fire/use. Preserve the
++    // cast's original keyboard behavior and never skip the bunny animation.
++    const bool skip = !autoplay && !cast && pressed && finaleHoldTics > 1;
++    if(!automatic && !skip) return;
++    if(!campaignStart.empty()) {
++        ++campaigns;
++        G_DeferedInitNew(gameskill, campaignStart.c_str());
++        return;
++    }
++    int episode = GameModeInfo->flags & GIF_MAPXY ? 1 : gameepisode + 1;
++    if(episode > GameModeInfo->numEpisodes || GameModeInfo->flags & GIF_MAPXY) {
++        episode = 1;
++        ++campaigns;
++    }
++    G_DeferedInitNewNum(gameskill, episode, 1);
++}
+diff --git a/source/desktop_bridge.h b/source/desktop_bridge.h
+new file mode 100644
+index 0000000..0efc869
+--- /dev/null
++++ b/source/desktop_bridge.h
+@@ -0,0 +1,27 @@
++// Copyright (C) 2026 slogonomo and Live Doom contributors
++// SPDX-License-Identifier: GPL-3.0-or-later
++// Live desktop/screen-saver transport.
++#ifndef DESKTOP_BRIDGE_H
++#define DESKTOP_BRIDGE_H
++
++struct SDL_Surface;
++struct ticcmd_t;
++bool DD_Active();
++bool DD_Requested();
++bool DD_Paused();
++bool DD_FrameDirty();
++unsigned DD_RenderFPS();
++int DD_RenderLerp();
++void DD_SetRenderLerp(int fraction);
++bool DD_NativeQuit();
++void DD_Init();
++void DD_Poll();
++void DD_Export(SDL_Surface *surface);
++void DD_Heartbeat();
++void DD_RunTic();
++bool DD_ApplyAgentCommand(int player, ticcmd_t *command);
++void DD_FinaleBegin();
++void DD_FinaleTic(bool eligible, bool cast);
++void DD_PostMix(unsigned char *samples, int bytes, unsigned short format);
++
++#endif

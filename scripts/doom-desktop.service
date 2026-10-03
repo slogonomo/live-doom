@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: 0BSD
+[Unit]
+Description=Live Doom wallpaper and screensaver
+ConditionPathExists=@ROOT@/src/controller.py
+StartLimitIntervalSec=60
+StartLimitBurst=3
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+KillMode=control-group
+ExecStart=@PYTHON@ @ROOT@/src/controller.py daemon
+WorkingDirectory=@ROOT@
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+
+[Install]
+WantedBy=graphical-session.target

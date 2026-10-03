@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.slogonomo.live-doom",
+  "name": "Live Doom",
+  "version": "1.0.0",
+  "author": "slogonomo",
+  "description": "A bot plays Doom live on your desktop and as your screensaver, until you click in and take over. Plays your own Doom games (Steam's DOOM + DOOM II is detected), the free shareware episode or Freedoom, with a Doom-styled settings menu, a live background you can add to any theme, and an SDK for writing your own bots. Needs a one-time native build: see the README.",
+  "license": "0BSD AND CC0-1.0 AND GPL-3.0-or-later AND Zlib",
+  "kinds": [
+    "overlay",
+    "service"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "overlay": "menu/Menu.qml",
+    "service": "service/Service.qml"
+  }
+}

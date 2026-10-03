@@ -1,0 +1,8 @@
+{
+  "name": "Unstick",
+  "command": [
+    "/usr/bin/python3",
+    "unstick.py"
+  ],
+  "screensaver": true
+}

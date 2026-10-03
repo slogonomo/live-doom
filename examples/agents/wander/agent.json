@@ -1,0 +1,8 @@
+{
+  "name": "Wanderer",
+  "command": [
+    "/usr/bin/python3",
+    "wander.py"
+  ],
+  "screensaver": true
+}

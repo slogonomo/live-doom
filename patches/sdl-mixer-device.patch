@@ -1,0 +1,190 @@
+diff --git a/include/SDL_mixer.h b/include/SDL_mixer.h
+index 2c4dd09..b511e28 100644
+--- a/include/SDL_mixer.h
++++ b/include/SDL_mixer.h
+@@ -19,6 +19,13 @@
+   3. This notice may not be removed or altered from any source distribution.
+ */
+ 
++/*
++ * Altered by Live Doom (2026): preserve the mixer while releasing its device.
++ * Copyright (C) 2026 slogonomo and Live Doom contributors.
++ * These additions are licensed under 0BSD. The original zlib notice above
++ * continues to apply to the SDL_mixer code.
++ */
++
+ /**
+  *  \file SDL_mixer.h
+  *
+@@ -471,6 +478,31 @@ extern DECLSPEC int SDLCALL Mix_OpenAudioDevice(int frequency, Uint16 format, in
+  */
+ extern DECLSPEC void SDLCALL Mix_PauseAudio(int pause_on);
+ 
++/**
++ * Release or reopen the physical device without resetting the mixer.
++ *
++ * Live Doom extension: decoder/channel state, hooks, effects, volume and the
++ * logical open count are retained. Playback freezes while detached. Resume
++ * reopens the default output with the exact existing format and preserves the
++ * state last set by Mix_PauseAudio(). It does not start a song again.
++ *
++ * Call only on the main thread, serialized with all other mixer operations,
++ * outside audio callbacks and with no Mix_LockAudio() lock held.
++ *
++ * \param suspend nonzero to detach, zero to reopen; either is idempotent.
++ * \returns 0 on success, -1 if uninitialized or reopen fails. A failed reopen
++ *          leaves the device detached and playback stopped, ready for retry.
++ */
++extern DECLSPEC int SDLCALL Mix_LiveDoomSuspendDevice(int suspend);
++
++/**
++ * Return nonzero while the Live Doom physical device is detached.
++ *
++ * Uses the same main-thread serialization contract as the suspend operation.
++ * The mixer remains logically initialized until Mix_CloseAudio() is called.
++ */
++extern DECLSPEC int SDLCALL Mix_LiveDoomDeviceSuspended(void);
++
+ /**
+  * Find out what the actual audio device parameters are.
+  *
+diff --git a/src/mixer.c b/src/mixer.c
+index 25bd6de..e1f6cdb 100644
+--- a/src/mixer.c
++++ b/src/mixer.c
+@@ -19,6 +19,13 @@
+   3. This notice may not be removed or altered from any source distribution.
+ */
+ 
++/*
++ * Altered by Live Doom (2026): preserve the mixer while releasing its device.
++ * Copyright (C) 2026 slogonomo and Live Doom contributors.
++ * These additions are licensed under 0BSD. The original zlib notice above
++ * continues to apply to the SDL_mixer code.
++ */
++
+ #include "SDL.h"
+ 
+ #include "SDL_mixer.h"
+@@ -62,6 +69,16 @@ SDL_COMPILE_TIME_ASSERT(SDL_MIXER_PATCHLEVEL_max, SDL_MIXER_PATCHLEVEL <= 99);
+ static int audio_opened = 0;
+ static SDL_AudioSpec mixer;
+ static SDL_AudioDeviceID audio_device;
++static int live_doom_audio_paused;
++static int live_doom_device_detached;
++
++static void live_doom_close_device(void)
++{
++    if (audio_device) {
++        SDL_CloseAudioDevice(audio_device);
++        audio_device = 0;
++    }
++}
+ 
+ typedef struct _Mix_effectinfo
+ {
+@@ -534,6 +551,8 @@ int Mix_OpenAudioDevice(int frequency, Uint16 format, int nchannels, int chunksi
+     open_music(&mixer);
+ 
+     audio_opened = 1;
++    live_doom_audio_paused = 0;
++    live_doom_device_detached = 0;
+     SDL_PauseAudioDevice(audio_device, 0);
+     return 0;
+ }
+@@ -549,12 +568,63 @@ int Mix_OpenAudio(int frequency, Uint16 format, int nchannels, int chunksize)
+ /* Pause or resume the audio streaming */
+ void Mix_PauseAudio(int pause_on)
+ {
+-    SDL_PauseAudioDevice(audio_device, pause_on);
++    live_doom_audio_paused = !!pause_on;
++    if (audio_device) {
++        SDL_PauseAudioDevice(audio_device, pause_on);
++    }
+     Mix_LockAudio();
+     pause_async_music(pause_on);
+     Mix_UnlockAudio();
+ }
+ 
++/* Live Doom callers serialize this with every other mixer operation on the
++ * main thread. Never invoke it from a callback or while Mix_LockAudio is held. */
++int Mix_LiveDoomSuspendDevice(int suspend)
++{
++    SDL_AudioSpec desired, obtained;
++    SDL_AudioDeviceID next;
++
++    if (!audio_opened) {
++        return SDL_SetError("Mixer is not initialized");
++    }
++    if (suspend) {
++        if (!live_doom_device_detached) {
++            /* Close joins the callback before releasing the physical stream.
++             * Keep every decoder, channel, effect, hook and preference intact. */
++            live_doom_close_device();
++            live_doom_device_detached = 1;
++        }
++        return 0;
++    }
++    if (!live_doom_device_detached) {
++        return 0;
++    }
++
++    /* A new device starts paused. Reuse the exact mixer format so retained
++     * decoder/resampler state and the engine postmix buffer remain valid. */
++    desired = mixer;
++    desired.callback = mix_channels;
++    desired.userdata = NULL;
++    next = SDL_OpenAudioDevice(NULL, 0, &desired, &obtained, 0);
++    if (!next) {
++        return -1;
++    }
++    if (obtained.freq != mixer.freq || obtained.format != mixer.format ||
++        obtained.channels != mixer.channels || obtained.samples != mixer.samples) {
++        SDL_CloseAudioDevice(next);
++        return SDL_SetError("Audio device format changed");
++    }
++    audio_device = next;
++    live_doom_device_detached = 0;
++    SDL_PauseAudioDevice(audio_device, live_doom_audio_paused);
++    return 0;
++}
++
++int Mix_LiveDoomDeviceSuspended(void)
++{
++    return live_doom_device_detached;
++}
++
+ /* Dynamically change the number of channels managed by the mixer.
+    If decreasing the number of channels, the upper channels are
+    stopped.
+@@ -1411,8 +1481,9 @@ void Mix_CloseAudio(void)
+             Mix_SetMusicCMD(NULL);
+             Mix_HaltChannel(-1);
+             _Mix_DeinitEffects();
+-            SDL_CloseAudioDevice(audio_device);
+-            audio_device = 0;
++            live_doom_close_device();
++            live_doom_device_detached = 0;
++            live_doom_audio_paused = 0;
+             SDL_free(mix_channel);
+             mix_channel = NULL;
+ 
+@@ -1772,12 +1843,16 @@ int Mix_UnregisterAllEffects(int channel)
+ 
+ void Mix_LockAudio(void)
+ {
+-    SDL_LockAudioDevice(audio_device);
++    if (audio_device) {
++        SDL_LockAudioDevice(audio_device);
++    }
+ }
+ 
+ void Mix_UnlockAudio(void)
+ {
+-    SDL_UnlockAudioDevice(audio_device);
++    if (audio_device) {
++        SDL_UnlockAudioDevice(audio_device);
++    }
+ }
+ 
+ int Mix_MasterVolume(int volume)
