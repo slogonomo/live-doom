@@ -720,6 +720,7 @@ Item {
     root.freeRows(r, s)
 
     section("Game")
+    r.push({ kind: "slider", key: "bot.speed", label: "Bot speed", min: 25, max: 100, step: 5, digits: 0, suffix: "%" })
     r.push({ kind: "action", id: "iwad", label: "IWAD", value: "Change",
              detail: root.basename(g.iwad) + (g.iwad_title ? "  ·  " + g.iwad_title : "") })
     var pw = g.pwads || []

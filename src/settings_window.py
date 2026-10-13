@@ -147,11 +147,19 @@ def show():
         scale.set_value(cfg[key])
         scale.set_digits(digits)
         scale.set_name(key)
-        scale.connect('value-changed', lambda widget: update({key: round(widget.get_value(), digits) if digits else int(widget.get_value())}))
+        def changed(widget):
+            value = round(widget.get_value() / step) * step
+            value = round(value, digits) if digits else int(value)
+            if widget.get_value() != value:
+                widget.set_value(value)
+                return
+            update({key: value})
+        scale.connect('value-changed', changed)
         row.pack_start(scale, True, True, 0)
         box.pack_start(row, False, False, 0)
 
     slider('Blur when paused (%)', 'pause_blur', 0, 100, 1, 0)
+    slider('Bot speed (%)', 'bot_speed', 25, 100, 5, 0)
     slider('Mouse sensitivity', 'mouse_sensitivity', 0.1, 4, 0.1, 1)
     checkbox('Full mouselook (look up and down)', 'mouselook', box)
     steam_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)

@@ -1,3 +1,18 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 986852a..b62ef57 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -306,7 +306,9 @@ FIND_PACKAGE (SDL2 REQUIRED)
+ INCLUDE_DIRECTORIES (${SDL2_INCLUDE_DIR})
+ 
+ FIND_PACKAGE (SDL2_mixer REQUIRED)
+-INCLUDE_DIRECTORIES (${SDL2_MIXER_INCLUDE_DIR})
++# Our mixer header declares Live Doom's retained-device extension. A system
++# SDL2 directory may contain an unpatched SDL_mixer.h, so ours must win.
++INCLUDE_DIRECTORIES (BEFORE ${SDL2_MIXER_INCLUDE_DIR})
+ 
+ FIND_PACKAGE (SDL2_net REQUIRED)
+ INCLUDE_DIRECTORIES (${SDL2_NET_INCLUDE_DIR})
 diff --git a/source/autodoom/b_think.cpp b/source/autodoom/b_think.cpp
 index cfefd51..7d06b28 100644
 --- a/source/autodoom/b_think.cpp
@@ -23,7 +38,7 @@ index cfefd51..7d06b28 100644
  // EOF
 -
 diff --git a/source/d_main.cpp b/source/d_main.cpp
-index 88b20bf..3299053 100644
+index 88b20bf..69d48de 100644
 --- a/source/d_main.cpp
 +++ b/source/d_main.cpp
 @@ -33,6 +33,7 @@
@@ -77,7 +92,7 @@ index 88b20bf..3299053 100644
  
     oldgamestate = wipegamestate = gamestate;
  
-@@ -1983,8 +1988,70 @@ void D_DoomMain()
+@@ -1983,8 +1988,75 @@ void D_DoomMain()
        oldgamestate = GS_NOSTATE;
  
     // killough 12/98: inlined D_DoomLoop
@@ -85,6 +100,7 @@ index 88b20bf..3299053 100644
 +   uint64_t desktopRenderDeadline = 0;
 +   uint64_t desktopLastFrame = 0;
 +   unsigned desktopRenderFPS = 0;
++   int desktopClockRate = 0;
 +   bool desktopWasPaused = true;
     while(1)
     {
@@ -96,20 +112,24 @@ index 88b20bf..3299053 100644
 +         D_ProcessEvents();
 +         const uint64_t now = SDL_GetPerformanceCounter();
 +         const uint64_t frequency = SDL_GetPerformanceFrequency();
-+         const uint64_t step = frequency / 35;
++         const int clockRate = DD_ClockRate();
++         const uint64_t step = frequency * 100 /
++            (35 * static_cast<uint64_t>(clockRate > 0 ? clockRate : 100));
 +         const bool isPaused = DD_Paused();
 +         const unsigned renderFPS = DD_RenderFPS();
-+         if(isPaused || desktopWasPaused || now > desktopDeadline + step * 4)
++         if(isPaused || desktopWasPaused || clockRate != desktopClockRate ||
++            now > desktopDeadline + step * 4)
 +            desktopDeadline = now;
 +         if(isPaused || desktopWasPaused || renderFPS != desktopRenderFPS)
 +            desktopRenderDeadline = now;
 +         desktopRenderFPS = renderFPS;
++         desktopClockRate = clockRate;
 +         desktopWasPaused = isPaused;
 +         if(!isPaused)
 +         {
-+            // Simulation remains 35Hz even when native interpolated frames
-+            // render more frequently. Bound catch-up and discard suspended
-+            // time instead of advancing the world when the wallpaper resumes.
++            // Native game speed changes simulation tics, independently of
++            // the render cap. Bound catch-up and discard suspended time
++            // instead of advancing the world when the wallpaper resumes.
 +            for(unsigned count = 0; now >= desktopDeadline && count < 4; ++count)
 +            {
 +               DD_RunTic();
@@ -350,6 +370,19 @@ index 6e55a9d..b02d63b 100644
  void G_RecordDemo(const char *name);                // Only called by startup code.
  void G_RecordDemoContinue(const char *in, const char *name);
  void G_SetOldDemoOptions();
+diff --git a/source/hal/i_timer.cpp b/source/hal/i_timer.cpp
+index 72061d9..24cec9d 100644
+--- a/source/hal/i_timer.cpp
++++ b/source/hal/i_timer.cpp
+@@ -102,6 +102,8 @@ void I_InitHALTimer()
+    if((p = M_CheckParm("-speed")) && p < myargc-1 &&
+       (p = atoi(myargv[p+1])) >= 10 && p <= 1000)
+       clockRate = p;
++   // Keep -speed visible to the desktop scheduler and the i_gamespeed cvar.
++   realtic_clock_rate = clockRate;
+    
+    if(clockRate != 100)
+       I_GetTime_Scale = ((int64_t)clockRate << CLOCK_BITS) / 100;
 diff --git a/source/hu_stuff.cpp b/source/hu_stuff.cpp
 index b9562c1..a317ee4 100644
 --- a/source/hu_stuff.cpp
@@ -691,10 +724,10 @@ index 351f15f..218fb1a 100644
 -
 diff --git a/source/desktop_bridge.cpp b/source/desktop_bridge.cpp
 new file mode 100644
-index 0000000..593b386
+index 0000000..4fd9ac9
 --- /dev/null
 +++ b/source/desktop_bridge.cpp
-@@ -0,0 +1,1025 @@
+@@ -0,0 +1,1030 @@
 +// Copyright (C) 2026 slogonomo and Live Doom contributors
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +// One native game is authoritative; desktop and screen saver consume its frames.
@@ -1243,6 +1276,9 @@ index 0000000..593b386
 +        controlSensitivity = sensitivity;
 +        controlMouselook = value;
 +        applyControls();
++    } else if(sscanf(line.c_str(), "bot-speed %d %c", &value, &tail) == 1 &&
++              value >= 25 && value <= 100 && value % 5 == 0) {
++        realtic_clock_rate = value;
 +    } else if(sscanf(line.c_str(), "render %d %c", &value, &tail) == 1 && value >= 35 && value <= 120) {
 +        humanRenderFPS = value;
 +    } else if(line == "release") {
@@ -1304,7 +1340,9 @@ index 0000000..593b386
 +bool DD_Paused() { return suspended; }
 +bool DD_FrameDirty() { return enabled && revision != publishedRevision; }
 +unsigned DD_RenderFPS() { return autoplay ? 35 : humanRenderFPS; }
-+int DD_RenderLerp() { return autoplay || suspended ? FRACUNIT : renderLerp; }
++// Keep the configured/native bot rate across takeover; human play is normal.
++int DD_ClockRate() { return autoplay ? realtic_clock_rate : 100; }
++int DD_RenderLerp() { return suspended ? FRACUNIT : renderLerp; }
 +void DD_SetRenderLerp(int fraction) { renderLerp = std::max(0, std::min(fraction, FRACUNIT)); }
 +
 +bool DD_NativeQuit()
@@ -1722,10 +1760,10 @@ index 0000000..593b386
 +}
 diff --git a/source/desktop_bridge.h b/source/desktop_bridge.h
 new file mode 100644
-index 0000000..0efc869
+index 0000000..0bbb9e4
 --- /dev/null
 +++ b/source/desktop_bridge.h
-@@ -0,0 +1,27 @@
+@@ -0,0 +1,28 @@
 +// Copyright (C) 2026 slogonomo and Live Doom contributors
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +// Live desktop/screen-saver transport.
@@ -1739,6 +1777,7 @@ index 0000000..0efc869
 +bool DD_Paused();
 +bool DD_FrameDirty();
 +unsigned DD_RenderFPS();
++int DD_ClockRate();
 +int DD_RenderLerp();
 +void DD_SetRenderLerp(int fraction);
 +bool DD_NativeQuit();

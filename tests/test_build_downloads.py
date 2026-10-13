@@ -387,9 +387,15 @@ class SourceUpdateTests(PrivateFiles):
 
     def test_owned_old_revision_and_patch_upgrade_retains_previous_trees(self):
         self.prepare(self.old, self.old_patch)
+        # The mixer include-order fix adds the root CMake file to the owned patch.
+        (self.repositories / 'autodoom/CMakeLists.txt').write_text(
+            '# original fixture\n# patched mixer headers first\n')
+        self.new_patch = build_support.working_patch(self.repositories / 'autodoom')
         self.prepare(self.new, self.new_patch)
         self.assertEqual(self.revisions(), {name: pin['revision'] for name, pin in self.new['sources'].items()})
         self.assertEqual(build_support.working_patch(self.paths.vendor_root / 'autodoom'), self.new_patch)
+        self.assertIn('patched mixer headers first',
+                      (self.paths.vendor_root / 'autodoom/CMakeLists.txt').read_text())
         backups = list((self.paths.data_root / 'source-backups').glob('sources-*'))
         self.assertEqual(len(backups), 1)
         self.assertEqual(self.git(backups[0] / 'autodoom', 'rev-parse', 'HEAD').strip(), self.old['sources']['autodoom']['revision'])
@@ -519,6 +525,7 @@ class SourceUpdateTests(PrivateFiles):
         original = self.revisions()
         receipt = (self.paths.vendor_root / build_support.SOURCE_RECEIPT).read_bytes()
         cases = [(self.paths.vendor_root / 'SDL_net/payload', b'personal tracked edit'),
+                 (self.paths.vendor_root / 'autodoom/CMakeLists.txt', b'personal build edit'),
                  (self.paths.vendor_root / 'SDL_mixer/personal.txt', b'personal untracked file'),
                  (self.paths.vendor_root / 'SDL_mixer/settings.local', b'personal ignored file'),
                  (self.paths.vendor_root / 'autodoom/source/desktop_bridge.cpp', b'personal bridge edit')]

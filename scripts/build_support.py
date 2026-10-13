@@ -29,6 +29,7 @@ SOURCE_RECEIPT = '.live-doom-source-state.json'
 OWNED_PATCH = '.live-doom-desktop.patch'
 OWNED_MIXER_PATCH = '.live-doom-sdl-mixer-device.patch'
 SOURCE_NAMES = ('autodoom', 'SDL_mixer', 'SDL_net')
+AUTODOOM_PATCH_PATHS = ('CMakeLists.txt', 'source')
 
 
 def paths():
@@ -120,7 +121,7 @@ def source(directory, pin, fetch=False):
 
 def working_patch(directory):
     args = ('--binary', '--no-ext-diff', '--no-textconv', '--src-prefix=a/', '--dst-prefix=b/')
-    patch = git(directory, 'diff', *args, '--', 'source', capture=True)
+    patch = git(directory, 'diff', *args, '--', *AUTODOOM_PATCH_PATHS, capture=True)
     for name in ('desktop_bridge.cpp', 'desktop_bridge.h'):
         patch += git(directory, 'diff', '--no-index', *args, '--', '/dev/null',
                      'source/' + name, capture=True, allowed=(1,))
@@ -221,7 +222,7 @@ def inspect_sources(value, metadata, desktop_patch, previous=None, previous_patc
         if name == 'autodoom':
             if git(directory, 'diff', '--cached', 'HEAD', capture=True).strip():
                 raise ValueError(dirty_message)
-            if git(directory, 'diff', 'HEAD', '--', '.', ':!source', ':!adlmidi', capture=True).strip():
+            if git(directory, 'diff', 'HEAD', '--', '.', ':!CMakeLists.txt', ':!source', ':!adlmidi', capture=True).strip():
                 raise ValueError(dirty_message)
             for entry in status.split(b'\0'):
                 if not entry:
@@ -236,7 +237,7 @@ def inspect_sources(value, metadata, desktop_patch, previous=None, previous_patc
                                   and patch_bytes == previous_patch)
                 if patch_bytes != desktop_patch and not owned_previous:
                     raise ValueError(dirty_message)
-            elif any(path.exists() or path.is_symlink() for path in bridges) or git(directory, 'diff', 'HEAD', '--', 'source', capture=True).strip():
+            elif any(path.exists() or path.is_symlink() for path in bridges) or git(directory, 'diff', 'HEAD', '--', *AUTODOOM_PATCH_PATHS, capture=True).strip():
                 raise ValueError(dirty_message)
         elif name == 'SDL_mixer':
             if (git(directory, 'diff', '--cached', 'HEAD', capture=True).strip()

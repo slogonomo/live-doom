@@ -5,6 +5,7 @@ Run after the explicit XDG build. No compositor, session IPC, production
 configuration, network, retail game data or input devices are used.
 """
 from pathlib import Path
+import hashlib
 import os
 import re
 import sys
@@ -123,6 +124,78 @@ class NativeLifecycleTests(unittest.TestCase):
         self.assertEqual(turning['owner'], 0)
         self.assertGreater(turning['leveltime'], before['leveltime'])
         self.wait(lambda h: (h.get('x'), h.get('y')) != (before['x'], before['y']))
+
+    def test_bot_speed_scales_tics_and_human_takeover_restores_normal_speed(self):
+        # A fresh -speed launch must affect the desktop scheduler, even though
+        # native rendering continues at 35 fps. Use the controller handback
+        # command sent by the viewer's F12 handler, without host input devices.
+        self.ctrl.shutdown_engine(checkpoint=False)
+        self.ctrl.config['bot_speed'] = 25
+        self.ctrl.start_engine()
+        args = self.ctrl.engine.args
+        self.assertEqual(args[args.index('-speed') + 1], '25')
+        pid = self.ctrl.engine.pid
+        self.ctrl.locked = False
+        self.ctrl.views = {'TEST': {'empty': True, 'awake': True, 'focused': True, 'workspace': 1}}
+        self.ctrl.policy()
+
+        def rate(owner, expected):
+            self.wait(lambda h: h.get('owner') == owner and h.get('paused') == 0)
+            time.sleep(0.15)
+            before = read_header(self.runtime / 'frame.bin')
+            started = time.monotonic()
+            time.sleep(1)
+            after = read_header(self.runtime / 'frame.bin')
+            measured = (after['tic'] - before['tic']) / (time.monotonic() - started)
+            self.assertAlmostEqual(measured, 35 * expected / 100, delta=3)
+            self.assertEqual(after['pid'], pid)
+            self.assertEqual(after['render_fps'], 35)
+            return before, after
+
+        rate(0, 25)
+        # Copy real pixels under the framebuffer's sequence guard. Two
+        # different images at the same world tic prove interpolation rather
+        # than merely proving that the renderer wakes up more often.
+        frame_path = self.runtime / 'frame.bin'
+        seen = {}
+        deadline = time.monotonic() + 3
+        interpolated = False
+        while time.monotonic() < deadline:
+            header = read_header(frame_path)
+            if not header:
+                continue
+            with frame_path.open('rb') as stream:
+                stream.seek(4096)
+                pixels = stream.read(header['stride'] * header['height'])
+            if read_header(frame_path).get('seq') != header['seq']:
+                continue
+            sample = (hashlib.sha256(pixels).digest(), header['render_lerp'])
+            previous = seen.get(header['tic'])
+            if previous and previous[0] != sample[0] and previous[1] != sample[1]:
+                interpolated = True
+                break
+            seen[header['tic']] = sample
+            time.sleep(0.005)
+        self.assertTrue(interpolated, 'Slowed bot pixels must interpolate within a world tic')
+        self.ctrl.config['screensaver_enabled'] = True
+        self.assertEqual(self.ctrl.command('screensaver-preview'), 'OK')
+        rate(0, 25)
+        self.assertEqual(self.ctrl.command('dismiss'), 'OK')
+        self.assertEqual(self.ctrl.command('takeover TEST'), 'OK')
+        rate(2, 100)
+        self.assertEqual(self.ctrl.command('bot'), 'OK')
+        rate(0, 25)
+
+        # Native i_gamespeed remains effective too, including a percentage
+        # outside the controller slider's five-percent increments.
+        self.assertEqual(self.ctrl.command('takeover TEST'), 'OK')
+        answers = self.endgame_console('i_gamespeed 33')
+        self.assertEqual(answers, ['OK'] * len(answers))
+        time.sleep(0.15)
+        self.assertEqual(self.ctrl.command('bot'), 'OK')
+        rate(0, 33)
+        self.assertEqual(self.ctrl.reload_config(self.ctrl.config | {'bot_speed': 50}), 'OK')
+        rate(0, 50)
 
     def test_native_sound_preferences_survive_gate_pause_unload_and_restart(self):
         expected = (0, 7, 0, 16)

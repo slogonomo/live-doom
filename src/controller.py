@@ -37,6 +37,7 @@ ROOT = Path(__file__).resolve().parents[1]
 GAME_KEYS = ('iwad', 'pwads', 'skill', 'start_map', 'game_package')
 MAP_LABEL = re.compile(r'(?:E[1-9]M[1-9]|MAP(?:0[1-9]|[1-9][0-9]))\Z')
 ACTIVE_RENDER_FPS = 35
+LOCK_FALLBACK_INTERVAL = 5.0
 
 
 def prepare_native_config(path, forced, defaults=None):
@@ -126,7 +127,7 @@ def settings_path() -> Path:
 
 def config_for(path: Path):
     default = {'iwad': str(ProjectPaths.from_env().default_iwad), 'pwads': [],
-               'watch_sound': False, 'skill': 2, 'enabled': True,
+               'watch_sound': False, 'skill': 2, 'enabled': True, 'bot_speed': 100,
                'render_width': 0, 'render_height': 0,
                'wallpaper_enabled': True, 'wallpaper_mode': 'empty',
                'wallpaper_behind_windows': 'light',
@@ -218,6 +219,8 @@ def validate_config(config):
         raise ValueError('Doom shareware cannot load custom WADs. Choose a complete Doom or Doom II IWAD, or Freedoom.')
     if type(config['skill']) is not int or not 1 <= config['skill'] <= 5:
         raise ValueError('Doom skill must be between 1 and 5.')
+    if type(config['bot_speed']) is not int or not 25 <= config['bot_speed'] <= 100 or config['bot_speed'] % 5:
+        raise ValueError('Bot speed must be between 25 and 100% in steps of 5%.')
     render_dimensions(config, headless=True)
     if config['wallpaper_mode'] not in ('empty', 'all'):
         raise ValueError('Live background must use empty desktops or all desktops.')
@@ -334,6 +337,34 @@ def workspace_views(monitors, clients):
     return views
 
 
+def derived_lock(monitors):
+    """Read the session lock from Hyprland's solitaryBlockedBy; None if undetermined.
+
+Each `omarchy-shell lock isLocked` call opens a shell IPC connection, and Quickshell
+leaks every one until it exits: polling it several times a second made a
+day-old shell take over a minute to quit. LOCK wins across outputs; a present
+null or a blocker list past WORKSPACE means unlocked.
+"""
+    if not isinstance(monitors, list) or len(monitors) > 128:
+        return None
+    readable = False
+    for monitor in monitors:
+        if not isinstance(monitor, dict) or 'solitaryBlockedBy' not in monitor:
+            continue
+        blockers = monitor['solitaryBlockedBy']
+        if blockers is None:
+            readable = True
+            continue
+        if (not isinstance(blockers, list) or len(blockers) > 128
+                or any(not isinstance(value, str) or not value or len(value) > 128
+                       for value in blockers)):
+            continue
+        if 'LOCK' in blockers:
+            return True
+        readable |= 'WORKSPACE' not in blockers
+    return False if readable else None
+
+
 def output_render_rates(monitors):
     """Use native Doom cadence on every output, independent of refresh rate."""
     rates = {}
@@ -368,6 +399,7 @@ class Controller:
             self.last_error = f'Invalid settings restored from the last working configuration: {exc}'
         self.views = {'TEST': {'empty': True, 'workspace': (1, 0), 'awake': True, 'focused': True}} if headless else {}
         self.locked = False
+        self.lock_fallback = None  # (locked, monotonic start) of the last shell lock query
         self.snapshot_ok = headless
         self.human_output = None
         self.human_workspace = None
@@ -383,6 +415,7 @@ class Controller:
         self.native_schema = 2
         self.last_human_quits = 0
         self.last_controls = None
+        self.last_bot_speed = 100
         self.menu_until = 0.0
         self.mode = 'paused'
         self.alive = True
@@ -485,6 +518,7 @@ class Controller:
         args = [str(self.paths.engine), '-base', str(self.paths.engine_base),
                 '-user', str(user), '-save', str(saves), '-config', str(engine_config),
                 '-iwad', str(iwad), '-skill', str(int(self.config['skill'])),
+                '-speed', str(self.config['bot_speed']),
                 '-warp', self.config['start_map'] or '1']
         addons = [str(w) for w in files[1:]] + ([str(adapter)] if adapter is not None else [])
         if addons:
@@ -521,6 +555,9 @@ class Controller:
                 return self.start_engine(recover_checkpoint=False)
         self.last_policy = None
         self.last_controls = None
+        # The launch argument already applies the saved bot rate before the
+        # first world tic. Ownership selects normal speed for human play.
+        self.last_bot_speed = self.config['bot_speed']
         if adapter is not None:
             answer = engine_request('campaign ' + self.config['start_map'], self.runtime)
             if answer != 'OK':
@@ -535,6 +572,14 @@ class Controller:
             if answer != 'OK':
                 raise RuntimeError('Unable to apply mouse settings: ' + answer)
             self.last_controls = controls
+
+    def apply_bot_speed(self):
+        speed = self.config['bot_speed']
+        if speed != self.last_bot_speed:
+            answer = engine_request(f'bot-speed {speed}', self.runtime)
+            if answer != 'OK':
+                raise RuntimeError('Unable to apply bot speed: ' + answer)
+            self.last_bot_speed = speed
 
     def engine_loaded(self):
         return self.engine is not None and self.engine.poll() is None
@@ -665,7 +710,7 @@ class Controller:
         previous = dict(self.config)
         try:
             candidate = config_for(self.config_path) if candidate is None else candidate
-            candidate = {'wallpaper_behind_windows': 'light'} | dict(candidate) | {'keep_game_loaded': False}
+            candidate = {'wallpaper_behind_windows': 'light', 'bot_speed': 100} | dict(candidate) | {'keep_game_loaded': False}
             validate_config(candidate)
             if candidate['agent_selected'] != previous['agent_selected'] and candidate['agent_selected'] != 'autodoom':
                 self.agents.available()
@@ -716,6 +761,7 @@ class Controller:
                         raise RuntimeError('Unable to change render dimensions: ' + answer)
                     self.render_size = dimensions
                 self.apply_controls()
+                self.apply_bot_speed()
             if not (self.config['enabled'] and self.config['screensaver_enabled']):
                 self.stop_saver()
             self.reconcile_runtime()
@@ -730,6 +776,7 @@ class Controller:
                     self.render_size = old_size
                 self.last_controls = None
                 self.apply_controls()
+                self.apply_bot_speed()
             else:
                 self.shutdown_engine(checkpoint=False)
                 self.reconcile_runtime()
@@ -776,14 +823,21 @@ class Controller:
                     result = bounded_run(['/usr/bin/hyprctl', '-j', what], timeout=2, check=True)
                     return json.loads(result.stdout)
                 monitors, clients = fetch('monitors'), fetch('clients')
-                lock = bounded_run(['/usr/bin/omarchy-shell', 'lock', 'isLocked'], timeout=2,
-                                   max_output_bytes=16384, check=True).stdout.decode().strip()
-                if lock not in ('true', 'false'):
-                    raise ValueError('Unknown lock state')
+                locked = derived_lock(monitors)
+                if locked is None:
+                    # Fall back to the shell at most every LOCK_FALLBACK_INTERVAL seconds.
+                    began = time.monotonic()
+                    if self.lock_fallback is None or began - self.lock_fallback[1] >= LOCK_FALLBACK_INTERVAL:
+                        lock = bounded_run(['/usr/bin/omarchy-shell', 'lock', 'isLocked'], timeout=2,
+                                           max_output_bytes=16384, check=True).stdout.decode().strip()
+                        if lock not in ('true', 'false'):
+                            raise ValueError('Unknown lock state')
+                        self.lock_fallback = (lock == 'true', began)
+                    locked = self.lock_fallback[0]
                 with self.sync:
                     self.views = workspace_views(monitors, clients)
                     self.output_rates = output_render_rates(monitors)
-                    self.locked = lock == 'true'
+                    self.locked = locked
                     self.snapshot_ok = True
                     self.pending_render_size = render_dimensions(self.config, monitors=monitors)
             except (OSError, ValueError, subprocess.SubprocessError):
@@ -972,7 +1026,8 @@ class Controller:
             mode = 'hidden' if hidden or not view else 'paused' if paused else 'human' if output == self.human_output else 'bot'
             reserved = (view or {}).get('reserved', (0, 0, 0, 0))
             insets = ' '.join(str(value) for value in reserved)
-            # Simulation and exported observations retain their native rate.
+            # Simulation uses the configured bot clock independently of this
+            # presentation stride; observations still come from every tic.
             # Only a busy output showing the background everywhere needs fewer
             # viewer presentations; older viewers ignore this optional tail.
             stride = ' 4' if (mode == 'bot' and self.config['wallpaper_mode'] == 'all'
@@ -1108,7 +1163,7 @@ class Controller:
                        'game.iwad': 'iwad', 'game.pwads': 'pwads', 'game.skill': 'skill',
                        'game.start_map': 'start_map',
                        'agent.selected': 'agent_selected',
-                       'agent.screensaver': 'agent_screensaver'}
+                       'agent.screensaver': 'agent_screensaver', 'bot.speed': 'bot_speed'}
             key = aliases.get(parts[1])
             if not key:
                 return 'ERR unknown or read-only setting'
@@ -1224,6 +1279,7 @@ class Controller:
                   'tnt.wad': 'TNT: Evilution', 'plutonia.wad': 'The Plutonia Experiment'}
         metadata = {} if self.headless else live_wallpaper_metadata(Path.home(), ROOT / 'assets/live-doom.webp')
         return {'agent': self.agents.settings(),
+                'bot': {'speed': cfg['bot_speed']},
                 'onboarding': onboarding.settings(self.state, home=Path.home(),
                     downloading=self.onboarding_downloading, config=cfg),
                 'runtime': {'loaded': self.engine_loaded()},
@@ -1285,6 +1341,7 @@ class Controller:
         close_process_log(self.engine)
         self.engine = None
         self.last_policy = self.last_controls = self.last_render_rate = None
+        self.last_bot_speed = 100
         self.render_size = None
         self.last_unload_attempt = 0.0
 

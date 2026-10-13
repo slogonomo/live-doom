@@ -48,6 +48,7 @@ OMIT_SCRIPTS = frozenset(("scripts/build-virtual-click.sh", "scripts/test-viewer
 OMIT_PROTOCOLS = frozenset(("src/protocols/wlr-virtual-pointer-unstable-v1.xml",))
 PORTABLE_TESTS = frozenset(("tests/test_agent_control.py", "tests/test_background_selection.py",
                            "tests/test_bot_progress.py",
+                           "tests/test_bot_speed.py",
                            "tests/test_dimensions.py", "tests/test_live_wallpaper.py",
                            "tests/test_steam_games.py", "tests/test_control_server.py",
                            "tests/test_project_paths.py", "tests/test_marketplace_install.py",

@@ -259,6 +259,36 @@ class RenderOwnershipPolicyTests(unittest.TestCase):
         self.assertTrue(self.ctrl.views["TEST"]["focused"])
         self.native.assert_not_called()
 
+    def test_snapshot_reads_lock_from_hyprland_and_rate_limits_the_shell_fallback(self):
+        known = [{"name": "TEST", "activeWorkspace": {"id": 1}, "specialWorkspace": {"id": 0},
+                  "dpmsStatus": True, "solitaryBlockedBy": ["LOCK", "WINDOWED"]}]
+        unknown = [{"name": "TEST", "activeWorkspace": {"id": 1}, "specialWorkspace": {"id": 0},
+                    "dpmsStatus": True}]
+        clock = [100.0]
+        for monitors, cycles, locked, shell_calls in ((known, 3, True, 0), (unknown, 3, False, 1)):
+            with self.subTest(blockers="solitaryBlockedBy" in monitors[0]):
+                self.ctrl.lock_fallback = None
+                answers = {"monitors": json.dumps(monitors).encode(), "clients": b"[]", "isLocked": b"false"}
+                calls, remaining = [], [cycles]
+
+                def run(args, **_):
+                    calls.append(args[-1])
+                    return Mock(stdout=answers[args[-1]])
+
+                def cycle(_):
+                    clock[0] += 1.0
+                    remaining[0] -= 1
+                    self.ctrl.alive = remaining[0] > 0
+
+                self.ctrl.alive = True
+                with patch("controller.bounded_run", side_effect=run), \
+                     patch("controller.time.sleep", side_effect=cycle), \
+                     patch("controller.time.monotonic", side_effect=lambda: clock[0]):
+                    self.ctrl.snapshots()
+                self.assertTrue(self.ctrl.snapshot_ok)
+                self.assertEqual(self.ctrl.locked, locked)
+                self.assertEqual(calls.count("isLocked"), shell_calls)
+
     def test_human_rate_applies_once_and_ignores_monitor_refresh_changes(self):
         self.ctrl.output_rates = {"TEST": 100}
         self.assertEqual(self.ctrl.command("takeover TEST"), "OK")
