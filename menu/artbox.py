@@ -20,6 +20,7 @@ from pathlib import Path
 
 MAX_BYTES = 16 << 20
 MAX_SIDE = 4096
+MAX_PIXELS = 1280 * 720     # the shell keeps the banner decoded at full size; Steam's DOOM logos are 640x360
 ALPHA_MIN = 24              # ignore faint anti-alias haze at the edges
 
 
@@ -97,7 +98,7 @@ def box(path: Path) -> dict:
     if ihdr is None:
         raise ValueError("no IHDR")
     width, height, depth, color, _, _, interlace = ihdr
-    if not (0 < width <= MAX_SIDE and 0 < height <= MAX_SIDE):
+    if not (0 < width <= MAX_SIDE and 0 < height <= MAX_SIDE) or width * height > MAX_PIXELS:
         raise ValueError("image too large")
     whole = {"width": width, "height": height, "x": 0, "y": 0, "w": width, "h": height}
     channels = {6: 4, 4: 2}.get(color)

@@ -32,6 +32,7 @@ Item {
         Image {
           visible: !!parent.glyph
           source: parent.glyph ? "file://" + root.font.dir + "/" + parent.glyph.file : ""
+          sourceSize: parent.glyph ? Qt.size(parent.glyph.w, parent.glyph.h) : undefined   // decode no larger than the index says
           width: parent.glyph ? parent.glyph.w * root.pixel : 0
           height: parent.glyph ? parent.glyph.h * root.pixel : 0
           smooth: false

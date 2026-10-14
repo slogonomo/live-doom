@@ -544,7 +544,7 @@ Item {
             next[artProc.path] = b
             root.artBoxes = next
           }
-        } catch (e) { /* show the whole image */ }
+        } catch (e) { /* no box: the banner stays on the title text */ }
       }
     }
   }

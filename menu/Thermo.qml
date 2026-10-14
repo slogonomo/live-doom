@@ -27,6 +27,7 @@ Item {
   implicitHeight: barH
 
   function src(name) { return "file://" + font.dir + "/" + p[name].file }
+  function size(name) { return Qt.size(p[name].w, p[name].h) }   // decode no larger than the index says
 
   // The thumb sits on cell round(value * (cells - 1)); a pick is the exact
   // inverse, so pressing on the thumb (how a drag starts) never moves it.
@@ -41,16 +42,17 @@ Item {
 
   Row {
     visible: root.usable
-    Image { source: root.usable ? root.src("M_THERML") : ""; width: root.capW; height: root.barH; smooth: false }
+    Image { source: root.usable ? root.src("M_THERML") : ""; sourceSize: root.usable ? root.size("M_THERML") : undefined; width: root.capW; height: root.barH; smooth: false }
     Repeater {
       model: root.usable ? root.cells : 0
-      Image { source: root.src("M_THERMM"); width: root.cellW; height: root.barH; smooth: false }
+      Image { source: root.src("M_THERMM"); sourceSize: root.size("M_THERMM"); width: root.cellW; height: root.barH; smooth: false }
     }
-    Image { source: root.usable ? root.src("M_THERMR") : ""; width: root.capW; height: root.barH; smooth: false }
+    Image { source: root.usable ? root.src("M_THERMR") : ""; sourceSize: root.usable ? root.size("M_THERMR") : undefined; width: root.capW; height: root.barH; smooth: false }
   }
   Image {
     visible: root.usable
     source: root.usable ? root.src("M_THERMO") : ""
+    sourceSize: root.usable ? root.size("M_THERMO") : undefined
     smooth: false
     width: root.usable ? root.p.M_THERMO.w * root.pixel : 0
     height: root.usable ? root.p.M_THERMO.h * root.pixel : 0

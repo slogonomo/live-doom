@@ -148,6 +148,7 @@ Item {
           id: logo
           readonly property var patch: m.fontIndex && m.fontIndex.patches ? m.fontIndex.patches.M_DOOM : null
           source: patch ? "file://" + m.fontIndex.dir + "/" + patch.file : ""
+          sourceSize: patch ? Qt.size(patch.w, patch.h) : undefined
           visible: !!patch
           smooth: false
           width: patch ? patch.w * (card.compact ? 2 : 1) : 0
@@ -251,7 +252,8 @@ Item {
             asynchronous: true
             smooth: true
             mipmap: true
-            source: rowItem.row.kind === "banner" && rowItem.row.image ? "file://" + encodeURI(rowItem.row.image) : ""
+            // only once artbox.py has checked the file (regular, at most 16 MiB and 4096 px a side)
+            source: box ? "file://" + encodeURI(rowItem.row.image) : ""
           }
           DoomText {
             visible: rowItem.row.kind === "banner" && bannerImage.status !== Image.Ready
@@ -291,6 +293,7 @@ Item {
               ? m.fontIndex.patches[m.skullFrame ? "M_SKULL2" : "M_SKULL1"] : null
             visible: rowItem.selected && !!p
             source: p ? "file://" + m.fontIndex.dir + "/" + p.file : ""
+            sourceSize: p ? Qt.size(p.w, p.h) : undefined
             smooth: false
             width: p ? p.w * 1.5 : 0
             height: p ? p.h * 1.5 : 0
